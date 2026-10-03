@@ -1,0 +1,30 @@
+[package]
+name = "color-history-h"
+version = "0.2.1"
+edition = "2021"
+license = "MIT"
+authors = ["HexBrowns"]
+description = "ColorHistory_H - color history for AviUtl2"
+publish = false
+
+[lib]
+name = "color_history_h"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1.0"
+aviutl2 = { version = "0.47", features = ["generic", "serde", "aviutl2-alias"] }
+aviutl2-eframe = "0.47"
+parking_lot = "0.12"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
