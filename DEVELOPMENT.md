@@ -9,11 +9,12 @@ AviUtl2 向け色履歴プラグイン（Rust 製 `.aux2`）。`PaletteHistory.a
 ## ビルド
 
 ```powershell
-cd AI\plugins\ColorHistory_H
-.\build.ps1            # release → Plugin\ColorHistory_H\ColorHistory_H.aux2（AviUtl2 起動中は配置しない）
-.\build.ps1 -NoDeploy
-cargo test
+python AI/tools/au2_build.py ColorHistory_H               # au2 release → 本番（C:\ProgramData\aviutl2）へ配置
+python AI/tools/au2_build.py ColorHistory_H --no-deploy   # 配置しない（本番との違いだけ出す）
+cargo test                                         # このフォルダで
 ```
+
+ビルドと同梱物は `aviutl2.toml`（[aviutl2-cli](https://github.com/sevenc-nanashi/aviutl2-cli)）が正本。このフォルダで `au2 release` だけを実行すると `release/` に au2pkg ができる。
 
 ## 構成
 

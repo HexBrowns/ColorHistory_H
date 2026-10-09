@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use aviutl2::generic::{EditHandleError, EditSection, EffectItemType, GlobalEditHandle, ReadSection};
 use parking_lot::RwLock;
@@ -149,21 +150,100 @@ pub(crate) fn collect_items(alias: &aviutl2::alias::Table) -> Vec<RawItem> {
     out
 }
 
-/// フォーカス中オブジェクトの色項目。未選択なら `None`。
-pub fn read_focused_colors() -> Result<Option<(ObjectId, Vec<ColorItem>)>, String> {
-    let raw = with_read_section(|read| {
+/// 色項目の住所の控え（v0.2.2）。同じオブジェクトで効果の並び（効果 ID の列）が変わらない間は、
+/// エイリアス全体を読まずに色の項目だけを読む。中間点の多いオブジェクトはエイリアスが長く、本体に作らせるのが重い
+/// （`issues/20261010_full_alias_read_on_every_update.md`）
+#[derive(Debug, Clone)]
+pub struct ColorLayout {
+    object: ObjectId,
+    effects: Vec<i64>,
+    keys: Vec<ColorItemKey>,
+    /// 項目ごとの、分かっている今の値（透明色は `None`）。`000000` を読んだときに引き継ぐ
+    known: Vec<Option<Rgb>>,
+    /// 最後にエイリアス全体を読んだ時刻
+    alias_at: Instant,
+}
+
+/// `000000` を読んだ項目があるとき、エイリアスで確かめ直す間隔（透明と黒を直接行き来したのを拾う）
+const BLACK_RECHECK: Duration = Duration::from_secs(2);
+
+/// 項目だけを読んだときの `000000`。**透明色の項目は `get_object_effect_item` では `000000` で返る**
+/// （エイリアスでは空。実機 2026-10-10、v0.2.2 で透明のまま黒が履歴に入った）ので、黒か透明か分からない
+fn is_black_raw(raw: &str) -> bool {
+    raw.trim().eq_ignore_ascii_case("000000")
+}
+
+/// 項目だけを読んだ値を色にする。`000000` は、前に分かっている値が黒か透明ならそれを引き継ぐ。
+/// それ以外（別の色から `000000` になった）は黒か透明か決められないので `None`（エイリアスで確かめる）
+pub(crate) fn resolve_item_values(raws: &[String], known: &[Option<Rgb>]) -> Option<Vec<Option<Rgb>>> {
+    let black = Rgb::from_item_value("000000");
+    raws.iter()
+        .zip(known)
+        .map(|(raw, prev)| {
+            if !is_black_raw(raw) {
+                return Some(Rgb::from_item_value(raw));
+            }
+            (prev.is_none() || *prev == black).then_some(*prev)
+        })
+        .collect()
+}
+
+enum Read {
+    NoObject,
+    /// 控えのとおりに色の項目だけを読んだ（値は `resolve_item_values` を通した後）
+    Items(ObjectId, Vec<(ColorItemKey, Option<Rgb>)>),
+    /// エイリアス全体を読んだ（効果の並びが取れなければ `None`）
+    Alias(ObjectId, Option<Vec<i64>>, Vec<RawItem>),
+}
+
+/// フォーカス中オブジェクトの色項目。未選択なら `None`。`layout` は前回の控えで、読み直したら差し替える
+pub fn read_focused_colors(layout: &mut Option<ColorLayout>) -> Result<Option<(ObjectId, Vec<ColorItem>)>, String> {
+    let cached = layout.clone();
+    let got = with_read_section(move |read| {
         let Some(object) = read.get_focused_object().map_err(|e| format!("{e:?}"))? else {
-            return Ok(None);
+            return Ok(Read::NoObject);
         };
         let id = object_id(&object);
+        let effects: Option<Vec<i64>> = read
+            .get_effects(object)
+            .ok()
+            .map(|v| v.into_iter().map(|e| read.get_effect_id(e).unwrap_or(-1)).collect());
+        if let (Some(c), Some(e)) = (&cached, &effects) {
+            if c.object == id && c.effects == *e {
+                let raws: Option<Vec<String>> = c
+                    .keys
+                    .iter()
+                    .map(|k| read.get_object_effect_item(object, &k.effect_name, k.effect_index, &k.item_name).ok())
+                    .collect();
+                // 読めない項目があれば（名前が変わったなど）エイリアスから取り直す。
+                // `000000` があるときは、黒か透明か決められないときと、前にエイリアスを読んでから時間がたったときも取り直す
+                if let Some(raws) = raws {
+                    let recheck = raws.iter().any(|r| is_black_raw(r)) && c.alias_at.elapsed() >= BLACK_RECHECK;
+                    if let Some(values) = resolve_item_values(&raws, &c.known).filter(|_| !recheck) {
+                        return Ok(Read::Items(id, c.keys.iter().cloned().zip(values).collect()));
+                    }
+                }
+            }
+        }
         let alias = read
             .object(object)
             .get_alias_parsed()
             .map_err(|e| format!("{e:?}"))?;
-        Ok(Some((id, collect_items(&alias))))
+        Ok(Read::Alias(id, effects, collect_items(&alias)))
     })?;
-    let Some((id, raw)) = raw else {
-        return Ok(None);
+    let (id, effects, raw) = match got {
+        Read::NoObject => {
+            *layout = None;
+            return Ok(None);
+        }
+        Read::Items(id, values) => {
+            if let Some(l) = layout.as_mut() {
+                l.known = values.iter().map(|(_, v)| *v).collect();
+            }
+            let items = values.into_iter().map(|(key, value)| ColorItem { key, value }).collect();
+            return Ok(Some((id, items)));
+        }
+        Read::Alias(id, effects, raw) => (id, effects, raw),
     };
     let mut names_by_effect: HashMap<String, HashSet<String>> = HashMap::new();
     let mut items = Vec::new();
@@ -183,6 +263,14 @@ pub fn read_focused_colors() -> Result<Option<(ObjectId, Vec<ColorItem>)>, Strin
             value: Rgb::from_item_value(&r.value),
         });
     }
+    // 効果の並びが取れたときだけ控える（取れなければ次も全体を読む）
+    *layout = effects.map(|effects| ColorLayout {
+        object: id,
+        effects,
+        keys: items.iter().map(|i| i.key.clone()).collect(),
+        known: items.iter().map(|i| i.value).collect(),
+        alias_at: Instant::now(),
+    });
     Ok(Some((id, items)))
 }
 
@@ -223,6 +311,21 @@ pub fn apply_color(key: &ColorItemKey, color: Rgb) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn black_is_ambiguous_with_transparent() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let black = Rgb::from_item_value("000000");
+        let red = Rgb::from_item_value("ff0000");
+        // 黒でない値はそのまま
+        assert_eq!(resolve_item_values(&s(&["ff0000"]), &[None]), Some(vec![red]));
+        // 透明だった項目が 000000 で返る → 透明のまま（v0.2.2 の最初の版はここで黒を記録した）
+        assert_eq!(resolve_item_values(&s(&["000000"]), &[None]), Some(vec![None]));
+        // 黒だった項目は黒のまま
+        assert_eq!(resolve_item_values(&s(&["000000"]), &[black]), Some(vec![black]));
+        // 別の色から 000000 になった → 黒か透明か決められないので、エイリアスで確かめる
+        assert_eq!(resolve_item_values(&s(&["ff0000", "000000"]), &[red, red]), None);
+    }
 
     const ALIAS: &str = "[Object]
 frame=0,59

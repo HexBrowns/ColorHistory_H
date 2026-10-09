@@ -22,7 +22,8 @@ pub enum Msg {
     Shutdown,
 }
 
-const MIN_READ_INTERVAL: Duration = Duration::from_millis(60);
+/// 読む間隔の下限（v0.2.2 で 60ms から広げた。値が落ち着いたとみなすのは 500ms なので、記録には響かない）
+const MIN_READ_INTERVAL: Duration = Duration::from_millis(200);
 const SAVE_DELAY: Duration = Duration::from_secs(1);
 
 pub struct Watcher {
@@ -75,6 +76,8 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
     let mut need_read = false;
     let mut record_now = false;
     let mut last_read: Option<Instant> = None;
+    // 色の項目の住所の控え（同じオブジェクトの間は、エイリアスを読まずに色の項目だけを読む）
+    let mut layout: Option<edit_ops::ColorLayout> = None;
 
     loop {
         let busy = need_read || tracker.has_pending() || shared.read().dirty_since.is_some();
@@ -110,10 +113,11 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
         if need_read && read_due {
             need_read = false;
             last_read = Some(Instant::now());
-            match edit_ops::catch_panic(edit_ops::read_focused_colors) {
+            match edit_ops::catch_panic(|| edit_ops::read_focused_colors(&mut layout)) {
                 Ok(Some((id, items))) => {
                     tracker.observe(Some(id), &items, now_ms);
                     let mut s = shared.write();
+                    let record_now_done = record_now;
                     if record_now {
                         record_now = false;
                         let mut count = 0;
@@ -132,18 +136,25 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
                             s.mark_dirty();
                         }
                     }
+                    // 値が変わったときだけ描き直す（ほかの項目のドラッグ中に、毎回描き直さない）
+                    let changed = record_now_done || s.focused.as_ref() != Some(&items);
                     s.focused = Some(items);
-                    s.request_repaint();
+                    if changed {
+                        s.request_repaint();
+                    }
                 }
                 Ok(None) => {
                     tracker.observe(None, &[], now_ms);
                     let mut s = shared.write();
+                    let changed = record_now || s.focused.is_some();
                     if record_now {
                         record_now = false;
                         s.status = "オブジェクトが選択されていません".into();
                     }
                     s.focused = None;
-                    s.request_repaint();
+                    if changed {
+                        s.request_repaint();
+                    }
                 }
                 Err(e) => {
                     // 起動直後・出力中などは読めない。黙って次の通知を待つ
