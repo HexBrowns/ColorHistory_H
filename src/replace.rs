@@ -393,9 +393,27 @@ pub fn search(q: &SearchQuery, project_path: Option<&Path>) -> Result<SearchResu
     Ok(result)
 }
 
+/// 置換する項目が、今表示しているシーンで見つけたものか。
+/// 違うシーンのものが 1 つでもあれば理由を返す（検索の後にシーンを切り替えた。ハンドルは別のシーンのオブジェクトを指す）。
+fn scene_mismatch(hits: &[Hit], current_scene: i32) -> Option<String> {
+    let other = hits
+        .iter()
+        .filter(|h| h.editable())
+        .find(|h| h.scene_id != current_scene)?;
+    Some(format!(
+        "検索した後にシーンが切り替わっています（検索したのは「{}」）。何も書き換えていません。もう一度検索してください",
+        other.scene_name
+    ))
+}
+
 /// チェックした項目を置き換える（ボタン操作専用）。1 回の編集セクション＝本体の Undo 1 回ぶん。
+/// 検索した後にシーンが切り替わっていたら、1 つも書かずに `Err` を返す。
 pub fn apply(hits: Vec<Hit>, target: Rgb, tolerance: u8, new: Rgb) -> Result<ReplaceReport, String> {
     edit_ops::with_edit_section(move |edit| {
+        if let Some(reason) = scene_mismatch(&hits, edit.info.scene_id) {
+            tracing::warn!(current_scene = edit.info.scene_id, "replace: scene changed after search");
+            return Err(reason);
+        }
         let mut report = ReplaceReport::default();
         for hit in hits {
             let Some(handle) = hit.object else {
@@ -515,6 +533,32 @@ mod tests {
         let places: Vec<String> = hits.iter().map(|h| h.place()).collect();
         assert_eq!(places, ["図形 / 色", "縁取り:1 / 縁色"]);
         assert_eq!(hits[0].scene_name, "サブ");
+    }
+
+    fn hit(scene_id: i32, editable: bool) -> Hit {
+        // 置換の前の判定だけを見るので、ハンドルは中身の無い値でよい（本体の API には渡さない）
+        let handle: aviutl2::sys::plugin2::OBJECT_HANDLE = 0x10usize as *mut std::ffi::c_void;
+        Hit {
+            scene_id,
+            scene_name: format!("シーン{scene_id}"),
+            object: editable.then(|| ObjectHandle::from(handle)),
+            layer: 0,
+            frame_start: 0,
+            frame_end: 10,
+            key: ColorItemKey { effect_name: "図形".into(), effect_index: 0, item_name: "色".into() },
+            kind: HitKind::ColorItem,
+            found: vec![rgb(0xff0000)],
+        }
+    }
+
+    #[test]
+    fn replace_refuses_when_scene_changed_after_search() {
+        // 検索したシーンのままなら書いてよい（他のシーンの一覧は置換の対象外なので数えない）
+        assert!(scene_mismatch(&[hit(0, true), hit(1, false)], 0).is_none());
+        // 検索の後に別のシーンへ切り替えたら、1 つも書かない
+        let reason = scene_mismatch(&[hit(0, true), hit(0, true)], 2).expect("切り替えを見つける");
+        assert!(reason.contains("シーン0"), "{reason}");
+        assert!(scene_mismatch(&[], 3).is_none());
     }
 
     #[test]

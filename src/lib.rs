@@ -3,6 +3,7 @@ mod color;
 mod edit_ops;
 mod eyedropper;
 mod history;
+mod input;
 mod replace;
 mod tracker;
 mod ui;
@@ -37,10 +38,17 @@ pub struct AppState {
     pub focused: Option<Vec<ColorItem>>,
     pub status: String,
     pub egui_ctx: Option<egui::Context>,
+    /// 起動時に履歴ファイルを読めず、退避もできなかった。この起動の間は保存しない
+    /// （読めなかったファイルを、空から始めた履歴で上書きしない）
+    pub save_blocked: bool,
 }
 
 impl AppState {
     pub fn mark_dirty(&mut self) {
+        // 保存しない間は未保存の印も付けない（保存を試みず、監視スレッドも短い間隔で回らない）
+        if self.save_blocked {
+            return;
+        }
         if self.dirty_since.is_none() {
             self.dirty_since = Some(Instant::now());
         }
@@ -134,15 +142,9 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
         init_logging();
         tracing::info!("ColorHistory_H v{} 初期化", env!("CARGO_PKG_VERSION"));
         let path = history::default_path();
-        let (store, warning) = match history::load(&path) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("ColorHistory_H: 履歴を読み込めませんでした: {e:#}");
-                (Store::default(), Some(format!("履歴を読み込めませんでした: {e:#}")))
-            }
-        };
+        let history::Loaded { store, warning, save_blocked } = history::load(&path);
         if let Some(w) = &warning {
-            tracing::warn!("{w}");
+            tracing::warn!("ColorHistory_H: {w}");
         }
         let shared = Arc::new(RwLock::new(AppState {
             status: warning.unwrap_or_default(),
@@ -152,6 +154,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
             dirty_since: None,
             focused: None,
             egui_ctx: None,
+            save_blocked,
         }));
         Ok(Self {
             window: Mutex::new(None),
@@ -206,7 +209,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
             if let Some(p) = project.get_path() {
                 s.project_path = Some(p);
             }
-            (s.store.clone(), s.path.clone(), s.dirty_since.is_some())
+            (s.store.clone(), s.path.clone(), s.dirty_since.is_some() && !s.save_blocked)
         };
         if dirty {
             match history::save(&path, &store) {

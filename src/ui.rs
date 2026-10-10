@@ -7,6 +7,7 @@ use aviutl2_eframe::{eframe, egui, AviUtl2EframeHandle};
 
 use crate::color::{CopyFormat, Rgb};
 use crate::history::{now_secs, Entry, SortMode, DEFAULT_LIST_ID, MAX_ENTRIES_MAX, MAX_ENTRIES_MIN};
+use crate::input::{self, LineEnd};
 use crate::replace::{self, Hit, SearchQuery, TOLERANCE_MAX};
 use crate::tracker::{ColorItem, ColorItemKey};
 use crate::watcher::Msg;
@@ -64,6 +65,8 @@ pub struct ColorHistoryApp {
     selected: Option<Rgb>,
     apply_target: Option<ColorItemKey>,
     label_edit: Option<(Rgb, String)>,
+    /// ラベルの編集を始めたフレームで、入力欄にフォーカスを移す
+    label_focus: bool,
     add_input: String,
     show_settings: bool,
     clear_armed_at: Option<Instant>,
@@ -88,6 +91,39 @@ fn elapsed_text(then: u64, now: u64) -> String {
         3600..=86_399 => format!("{} 時間前", d / 3600),
         _ => format!("{} 日前", d / 86_400),
     }
+}
+
+/// 数値欄（ルール au2-rs-plugin「入力の確定と取り消し」）。`configure` で範囲・速さを付けた `DragValue` に
+/// `update_while_editing(false)` を足して置く。打っている途中の値は使わず、Enter かほかをクリックで確定する。
+///
+/// egui 0.36.2 の `DragValue` は `update_while_editing(false)` でも、Esc の次のフレームで打った文字を値にしてしまう
+/// （フォーカスを失ったとみなす期間が 2 フレームあり、2 フレーム目には Esc が押されていないため）。
+/// Esc のフレームの値を覚えておき、次のフレームで戻す（参照実装 LayerSilenceCut_H の `setting_value`）。
+/// 戻したフレームは、欄を描く前と値が同じなら `changed()` を偽にする（件数の上限で保存を走らせない）
+fn drag_value<T>(
+    ui: &mut egui::Ui,
+    value: &mut T,
+    configure: impl for<'v> FnOnce(egui::DragValue<'v>) -> egui::DragValue<'v>,
+) -> egui::Response
+where
+    T: egui::emath::Numeric + Default + Send + Sync,
+{
+    let before = *value;
+    let mut resp = ui.add(configure(egui::DragValue::new(&mut *value)).update_while_editing(false));
+    let key = resp.id.with("escaped");
+    let pass = ui.ctx().cumulative_pass_nr();
+    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        ui.data_mut(|d| d.insert_temp(key, (pass, *value)));
+    } else if let Some((at, kept)) = ui.data_mut(|d| d.remove_temp::<(u64, T)>(key)) {
+        if pass == at + 1 {
+            *value = kept;
+            if *value == before {
+                // `flags` は egui の doc(hidden) の公開フィールド。`changed()` を外す手段がこれしかない（0.36.2）
+                resp.flags.remove(egui::response::Flags::CHANGED);
+            }
+        }
+    }
+    resp
 }
 
 fn small_swatch(ui: &mut egui::Ui, c: Option<Rgb>) {
@@ -123,6 +159,7 @@ impl ColorHistoryApp {
             selected: None,
             apply_target: None,
             label_edit: None,
+            label_focus: false,
             add_input: String::new(),
             show_settings: false,
             clear_armed_at: None,
@@ -181,6 +218,7 @@ impl ColorHistoryApp {
                         .map(|e| e.label.clone())
                         .unwrap_or_default();
                     self.label_edit = Some((c, current));
+                    self.label_focus = true;
                 }
                 Action::Delete(c) => {
                     let mut s = self.shared.write();
@@ -256,11 +294,13 @@ impl ColorHistoryApp {
     fn render_top(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             ui.toggle_value(&mut self.lists_open, "リスト");
-            ui.add(
+            // 打つたびに絞り込む（軽い）。入力中の Esc で入力前の文字に戻す
+            let search = ui.add(
                 egui::TextEdit::singleline(&mut self.search)
                     .hint_text("検索: カラーコード・ラベル")
                     .desired_width(ui.available_width().min(150.0)),
             );
+            input::track(ui, &search, &mut self.search);
             let mut s = self.shared.write();
             let mut sort = s.store.settings.sort;
             egui::ComboBox::from_id_salt("sort")
@@ -328,8 +368,7 @@ impl ColorHistoryApp {
         ui.horizontal_wrapped(|ui| {
             ui.label("件数の上限");
             let mut max = s.store.settings.max_entries;
-            if ui
-                .add(egui::DragValue::new(&mut max).range(MAX_ENTRIES_MIN..=MAX_ENTRIES_MAX).speed(2.0))
+            if drag_value(ui, &mut max, |d| d.range(MAX_ENTRIES_MIN..=MAX_ENTRIES_MAX).speed(2.0))
                 .on_hover_text("1 つのリストでピン留めしていない色の最大件数。超えたら最後に使ったのが古い色から消える")
                 .changed()
             {
@@ -368,7 +407,8 @@ impl ColorHistoryApp {
                     .hint_text("ff8000 / #ff8000 / 255,128,0")
                     .desired_width(140.0),
             );
-            let enter = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            // 追加するのは Enter かボタンのときだけ（ほかをクリックしただけでは追加しない）。Esc は入力前の文字に戻す
+            let enter = input::track(ui, &response, &mut self.add_input).enter();
             if ui.button("追加").clicked() || enter {
                 match Rgb::parse(&self.add_input) {
                     Some(c) => {
@@ -492,11 +532,19 @@ impl ColorHistoryApp {
         if let Some((color, text)) = &mut self.label_edit {
             let color = *color;
             let mut done = None;
+            let focus = std::mem::take(&mut self.label_focus);
             ui.horizontal(|ui| {
                 ui.label(format!("{} のラベル", color.hex()));
                 let response = ui.add(egui::TextEdit::singleline(text).desired_width(160.0));
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    done = Some(true);
+                if focus {
+                    response.request_focus();
+                }
+                // Enter で保存、入力中の Esc でやめる（ラベルは編集前のまま）。
+                // ほかをクリックしただけでは保存しない（「やめる」を押すとき、先にフォーカスが外れるため）
+                match input::track(ui, &response, text) {
+                    LineEnd::Committed { enter: true, .. } => done = Some(true),
+                    LineEnd::Reverted => done = Some(false),
+                    _ => {}
                 }
                 if ui.button("保存").clicked() {
                     done = Some(true);
@@ -539,7 +587,9 @@ impl ColorHistoryApp {
                     let can_apply = self.selected.is_some() && self.apply_target.is_some();
                     if ui
                         .add_enabled(can_apply, egui::Button::new("選択色を適用"))
-                        .on_hover_text("選択中オブジェクトの指定した色項目へ書き込む（AviUtl2 本体の元に戻すで取り消せる）")
+                        .on_hover_text(
+                            "フォーカス中のオブジェクトの指定した色項目へ書き込む（複数選んでいても、書き込むのはフォーカス中の 1 つだけ）\nAviUtl2 本体の元に戻すで取り消せる",
+                        )
                         .clicked()
                     {
                         if let (Some(c), Some(k)) = (self.selected, self.apply_target.clone()) {
@@ -548,18 +598,25 @@ impl ColorHistoryApp {
                     }
                 }
                 Some(_) => {
-                    ui.small("選択中オブジェクトに色の項目がありません");
+                    ui.small("フォーカス中のオブジェクトに色の項目がありません");
                 }
                 None => {
-                    ui.small("オブジェクトが選択されていません");
+                    ui.small("フォーカス中のオブジェクトがありません");
                 }
             }
         });
 
-        let (status, list_name) = {
+        let (status, list_name, save_blocked) = {
             let s = self.shared.read();
-            (s.status.clone(), s.store.active_list().name.clone())
+            (s.status.clone(), s.store.active_list().name.clone(), s.save_blocked)
         };
+        if save_blocked {
+            // 状態の欄は次の操作で上書きされるので、保存しないことは別に出し続ける
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "履歴ファイルを読めなかったので、この起動の間は履歴を保存しません（詳しくはログ）",
+            );
+        }
         ui.horizontal(|ui| {
             ui.small(status);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -646,7 +703,9 @@ impl ColorHistoryApp {
         ui.horizontal_wrapped(|ui| {
             ui.strong("一括置換");
             ui.label("探す色");
-            ui.add(egui::TextEdit::singleline(&mut self.replace.find).hint_text("rrggbb").desired_width(80.0));
+            // Enter で検索する（検索は読み取りだけ）。入力中の Esc で入力前の文字に戻す
+            let find = ui.add(egui::TextEdit::singleline(&mut self.replace.find).hint_text("rrggbb").desired_width(80.0));
+            let find_enter = input::track(ui, &find, &mut self.replace.find).enter();
             if ui.add_enabled(self.selected.is_some(), egui::Button::new("選択色")).clicked() {
                 if let Some(c) = self.selected {
                     self.replace.find = c.hex();
@@ -654,12 +713,12 @@ impl ColorHistoryApp {
             }
             small_swatch(ui, Rgb::parse(&self.replace.find));
             ui.label("しきい値 ±");
-            ui.add(egui::DragValue::new(&mut self.replace.tolerance).range(0..=TOLERANCE_MAX))
+            drag_value(ui, &mut self.replace.tolerance, |d| d.range(0..=TOLERANCE_MAX))
                 .on_hover_text("RGB の各成分の差がこの値以下なら同じ色とみなす（0 は完全一致、1 なら 1 だけ違う色もまとめる）");
             ui.checkbox(&mut self.replace.all_scenes, "全シーン")
                 .on_hover_text("他のシーンは最後に保存した .aup2 から探す（未保存の変更は反映されない）。置換できるのは表示中のシーンだけ");
             ui.checkbox(&mut self.replace.include_text, "テキスト内の <#rrggbb>");
-            if ui.button("検索").clicked() {
+            if ui.button("検索").clicked() || find_enter {
                 self.run_search();
             }
         });
@@ -716,7 +775,9 @@ impl ColorHistoryApp {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("置換後の色");
-            ui.add(egui::TextEdit::singleline(&mut self.replace.to).hint_text("rrggbb").desired_width(80.0));
+            // 置換はボタンを押したときだけ（Enter では本体へ書かない）。入力中の Esc で入力前の文字に戻す
+            let to = ui.add(egui::TextEdit::singleline(&mut self.replace.to).hint_text("rrggbb").desired_width(80.0));
+            input::track(ui, &to, &mut self.replace.to);
             if ui.add_enabled(self.selected.is_some(), egui::Button::new("選択色")).clicked() {
                 if let Some(c) = self.selected {
                     self.replace.to = c.hex();
@@ -815,7 +876,7 @@ impl ColorHistoryApp {
             }
             ui.separator();
             if let Some(items) = focused.as_ref().filter(|v| !v.is_empty()) {
-                ui.menu_button("選択中オブジェクトへ適用", |ui| {
+                ui.menu_button("フォーカス中のオブジェクトへ適用", |ui| {
                     for item in items {
                         if ui.button(item.key.label()).clicked() {
                             actions.push(Action::Apply(entry.color, item.key.clone()));
@@ -959,5 +1020,90 @@ impl eframe::App for ColorHistoryApp {
             self.run_actions(actions);
             ui.ctx().request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod drag_value_tests {
+    //! 数値欄を egui だけで動かし、打っている途中の値が使われないこと・Esc で戻ること・Enter で確定することを確かめる
+
+    use super::*;
+
+    /// 画面なしで 1 フレーム回す。出力の textures_delta を空にしてから捨てる
+    /// （そのまま捨てると、デバッグビルドで epaint の debug_assert「Dropped TexturesDelta with N unapplied deltas」に落ちる）
+    fn run_frame(ctx: &egui::Context, input: egui::RawInput, f: impl FnMut(&mut egui::Ui)) {
+        let mut out = ctx.run_ui(input, f);
+        out.textures_delta.clear();
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key { key: k, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }
+    }
+
+    /// 1 フレーム描き、`changed()` を返す。`focus` なら描く前に欄へフォーカスを移す（クリックと同じく全選択で編集に入る）
+    fn frame<T>(ctx: &egui::Context, value: &mut T, range: (T, T), events: Vec<egui::Event>, focus: bool) -> bool
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        let id_key = egui::Id::new("drag_value_test_id");
+        let mut changed = false;
+        let input = egui::RawInput { events, ..Default::default() };
+        run_frame(ctx, input, |ui| {
+            if focus {
+                if let Some(id) = ui.data(|d| d.get_temp::<egui::Id>(id_key)) {
+                    ui.memory_mut(|m| m.request_focus(id));
+                }
+            }
+            let resp = drag_value(ui, value, |d| d.range(range.0..=range.1));
+            ui.data_mut(|d| d.insert_temp(id_key, resp.id));
+            changed = resp.changed();
+        });
+        changed
+    }
+
+    /// 打つ（まだ確定しない）
+    fn type_in<T>(ctx: &egui::Context, value: &mut T, range: (T, T), typed: &str)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync,
+    {
+        frame(ctx, value, range, vec![], false);
+        frame(ctx, value, range, vec![], true);
+        frame(ctx, value, range, vec![egui::Event::Text(typed.into())], false);
+    }
+
+    /// 打つ → Esc → その後 3 フレーム、値は入力前のまま（`changed()` も偽）。Enter で確定した値は残る
+    fn check<T>(start: T, range: (T, T), typed: &str, expected: T)
+    where
+        T: egui::emath::Numeric + Default + Send + Sync + std::fmt::Debug,
+    {
+        let ctx = egui::Context::default();
+        let mut v = start;
+        type_in(&ctx, &mut v, range, typed);
+        assert_eq!(v, start, "打っている途中の値を使っている");
+        assert!(!frame(&ctx, &mut v, range, vec![key(egui::Key::Escape)], false));
+        for _ in 0..3 {
+            let changed = frame(&ctx, &mut v, range, vec![], false);
+            assert_eq!(v, start, "Esc の後のフレームでも入力前の値のまま");
+            assert!(!changed, "戻したフレームを「変わった」にしない");
+        }
+
+        type_in(&ctx, &mut v, range, typed);
+        assert!(frame(&ctx, &mut v, range, vec![key(egui::Key::Enter)], false));
+        for _ in 0..3 {
+            frame(&ctx, &mut v, range, vec![], false);
+        }
+        assert_eq!(v, expected, "Enter で確定した値は残る");
+    }
+
+    /// 件数の上限（usize）
+    #[test]
+    fn max_entries_escape_discards_and_enter_commits() {
+        check::<usize>(500, (MAX_ENTRIES_MIN, MAX_ENTRIES_MAX), "1234", 1234);
+    }
+
+    /// しきい値 ±（u8）
+    #[test]
+    fn tolerance_escape_discards_and_enter_commits() {
+        check::<u8>(0, (0, TOLERANCE_MAX), "12", 12);
     }
 }

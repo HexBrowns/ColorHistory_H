@@ -79,13 +79,30 @@ pub struct Settings {
     #[serde(default = "default_max_entries")]
     pub max_entries: usize,
     /// クリックでコピーする形式
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_if_unknown")]
     pub copy_format: CopyFormat,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "default_if_unknown")]
     pub sort: SortMode,
     /// 色見本 1 個の大きさ（px）
     #[serde(default = "default_swatch_size")]
     pub swatch_size: f32,
+}
+
+/// 列挙の項目を読む。知らない値（新しい版が足した並び順・コピー形式）は、その項目だけ初期値にする。
+/// 列挙をそのまま読むと、知らない値 1 つでファイル全体が読めなくなり、履歴ごと退避される。
+fn default_if_unknown<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match T::deserialize(&value) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            tracing::warn!("ColorHistory_H: 設定の値 {value} を読めないので初期値にします（{e}）");
+            Ok(T::default())
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -469,30 +486,69 @@ pub fn default_path() -> PathBuf {
         .join("history.json")
 }
 
-/// 読み込む。ファイルが無ければ空。壊れていたら退避してから空で始める（黙って上書きしない）。
-pub fn load(path: &Path) -> Result<(Store, Option<String>)> {
-    if !path.exists() {
-        return Ok((Store::default(), None));
+/// 読み込みの結果。
+#[derive(Debug)]
+pub struct Loaded {
+    pub store: Store,
+    /// 利用者に知らせること（退避した・保存しない）
+    pub warning: Option<String>,
+    /// 読めず、退避もできなかった。この起動の間は保存しない（読めなかったファイルを空の履歴で上書きしない）
+    pub save_blocked: bool,
+}
+
+/// 読み込む。ファイルが無ければ空。
+///
+/// 読めないとき（解析の失敗だけでなく、UTF-8 でない・ロック中などの I/O エラーも）は
+/// `history.broken-{秒}.json` へ退避してから空で始める。退避もできなければ `save_blocked` を立てる
+/// （ルール `au2-plugin-checklist`「設定ファイルの下位互換」）。
+pub fn load(path: &Path) -> Loaded {
+    let fresh = |warning: Option<String>, save_blocked: bool| Loaded {
+        store: Store::default(),
+        warning,
+        save_blocked,
+    };
+    let problem = match std::fs::read_to_string(path) {
+        Ok(text) => match serde_json::from_str::<Store>(&text) {
+            Ok(mut store) => {
+                store.normalize();
+                return Loaded { store, warning: None, save_blocked: false };
+            }
+            Err(e) => format!("解析できません: {e}"),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return fresh(None, false),
+        Err(e) => format!("読めません: {e}"),
+    };
+    let backup = backup_path(path);
+    match std::fs::rename(path, &backup) {
+        Ok(()) => fresh(
+            Some(format!(
+                "履歴ファイルを読めなかったので退避し、空の履歴で始めます: {}（{problem}）",
+                backup.display()
+            )),
+            false,
+        ),
+        Err(e) => fresh(
+            Some(format!(
+                "履歴ファイルを読めず、退避もできなかったので、この起動の間は履歴を保存しません: {}（{problem} / 退避: {e}）",
+                path.display()
+            )),
+            true,
+        ),
     }
-    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    match serde_json::from_str::<Store>(&text) {
-        Ok(mut store) => {
-            store.normalize();
-            Ok((store, None))
-        }
-        Err(e) => {
-            let backup = path.with_extension(format!("broken-{}.json", now_secs()));
-            std::fs::rename(path, &backup)
-                .with_context(|| format!("backup broken history to {}", backup.display()))?;
-            Ok((
-                Store::default(),
-                Some(format!(
-                    "履歴ファイルを読めなかったので退避しました: {}（{e}）",
-                    backup.display()
-                )),
-            ))
-        }
+}
+
+/// 読めなかった履歴の退避先（`history.broken-{秒}.json`。v0.2.3 までと同じ名前）。
+/// 同じ秒に退避したものがあれば番号を足す（退避済みのファイルを上書きしない）。
+fn backup_path(path: &Path) -> PathBuf {
+    let secs = now_secs();
+    let first = path.with_extension(format!("broken-{secs}.json"));
+    if !first.exists() {
+        return first;
     }
+    (2..)
+        .map(|n| path.with_extension(format!("broken-{secs}-{n}.json")))
+        .find(|p| !p.exists())
+        .expect("unbounded")
 }
 
 /// 一時ファイルに書いてから置き換える（書き込み途中で落ちても元のファイルを壊さない）。
@@ -644,23 +700,120 @@ mod tests {
         s.record(rgb(0x654321), "", 60);
         s.settings.copy_format = CopyFormat::TextTag;
         save(&path, &s).unwrap();
-        let (back, warn) = load(&path).unwrap();
-        assert!(warn.is_none());
-        assert_eq!(back, s);
+        assert!(!path.with_extension("json.tmp").exists(), "一時ファイルは置き換えで消える");
+        let loaded = load(&path);
+        assert!(loaded.warning.is_none());
+        assert!(!loaded.save_blocked);
+        assert_eq!(loaded.store, s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("colorhistory_h_{name}_{}_{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_file_starts_empty_and_can_save() {
+        let dir = test_dir("missing");
+        let loaded = load(&dir.join("history.json"));
+        assert!(loaded.warning.is_none());
+        assert!(!loaded.save_blocked);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn broken_file_is_backed_up_not_overwritten() {
-        let dir = std::env::temp_dir().join(format!("colorhistory_h_broken_{}", now_secs()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = test_dir("broken");
         let path = dir.join("history.json");
         std::fs::write(&path, "{ not json").unwrap();
-        let (s, warn) = load(&path).unwrap();
-        assert!(s.lists[0].entries.is_empty());
-        assert!(warn.is_some());
+        let loaded = load(&path);
+        assert!(loaded.store.lists[0].entries.is_empty());
+        assert!(loaded.warning.is_some());
+        assert!(!loaded.save_blocked, "退避できたら保存してよい");
         assert!(!path.exists(), "壊れたファイルは退避されている");
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "{ not json");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// UTF-8 でないファイル（解析より前の I/O エラー）も、解析の失敗と同じに退避する
+    #[test]
+    fn non_utf8_file_is_backed_up() {
+        let dir = test_dir("nonutf8");
+        let path = dir.join("history.json");
+        let bytes = [0x7b, 0x22, 0x82, 0xa0, 0x22, 0x7d]; // {"あ"} の CP932
+        std::fs::write(&path, bytes).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.warning.is_some());
+        assert!(!loaded.save_blocked);
+        assert!(!path.exists());
+        let backups: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), bytes, "中身はそのまま");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 同じ秒に 2 回退避しても、先の退避を上書きしない
+    #[test]
+    fn backup_does_not_overwrite_earlier_backup() {
+        let dir = test_dir("twice");
+        let path = dir.join("history.json");
+        std::fs::write(&path, "{ first").unwrap();
+        let _ = load(&path);
+        std::fs::write(&path, "{ second").unwrap();
+        let _ = load(&path);
+        let mut contents: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(contents, ["{ first", "{ second"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 他のプロセスが共有なしで開いている（読めず、退避の rename もできない）なら、保存しない
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_blocks_saving() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = test_dir("locked");
+        let path = dir.join("history.json");
+        std::fs::write(&path, r#"{"version":2,"lists":[]}"#).unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let loaded = load(&path);
+        assert!(loaded.save_blocked, "退避できなければ保存しない");
+        assert!(loaded.warning.is_some());
+        drop(lock);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"version":2,"lists":[]}"#,
+            "元のファイルは残っている"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 新しい版が足した並び順・コピー形式は、その項目だけ初期値にし、ほかの設定と履歴は読む
+    #[test]
+    fn unknown_enum_values_fall_back_per_field() {
+        let newer = r#"{"version":2,"lists":[{"id":"default","name":"デフォルト","entries":[{"color":"ff0000"}]}],
+            "active":"default","future_key":1,
+            "settings":{"auto_record":false,"max_entries":300,"copy_format":"Css","sort":{"Saturation":1},"swatch_size":32.0}}"#;
+        let mut s: Store = serde_json::from_str(newer).unwrap();
+        s.normalize();
+        assert_eq!(s.settings.copy_format, CopyFormat::default());
+        assert_eq!(s.settings.sort, SortMode::default());
+        assert!(!s.settings.auto_record);
+        assert_eq!(s.settings.max_entries, 300);
+        assert_eq!(s.settings.swatch_size, 32.0);
+        assert!(s.lists[0].get(rgb(0xff0000)).is_some());
+        // 知っている値はそのまま読む・欄が無ければ初期値
+        let known: Settings = serde_json::from_str(r#"{"copy_format":"Lua","sort":"Hue"}"#).unwrap();
+        assert_eq!((known.copy_format, known.sort), (CopyFormat::Lua, SortMode::Hue));
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing, Settings::default());
     }
 }

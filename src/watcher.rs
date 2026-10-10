@@ -187,6 +187,10 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
 fn save_if_dirty(shared: &SharedState, force: bool) {
     let (store, path) = {
         let s = shared.read();
+        // 起動時に履歴を読めず退避もできなかった。読めなかったファイルを上書きしない
+        if s.save_blocked {
+            return;
+        }
         let Some(since) = s.dirty_since else {
             return;
         };
