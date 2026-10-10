@@ -453,7 +453,7 @@ dependencies = [
 
 [[package]]
 name = "color-history-h"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "aviutl2",

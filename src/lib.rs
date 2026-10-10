@@ -14,7 +14,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aviutl2::generic::__bridge::GenericSingleton;
-use aviutl2::raw_window_handle::HasWindowHandle;
 use aviutl2::AnyResult;
 use aviutl2_eframe::egui;
 use parking_lot::{Mutex, RwLock};
@@ -100,34 +99,6 @@ impl ColorHistoryPlugin {
         }
         self.window_created.store(true, Ordering::Release);
         Ok(())
-    }
-
-    fn open_window(&self) -> AnyResult<()> {
-        self.ensure_window()?;
-        let hwnd = {
-            let guard = self.window.lock();
-            let window = guard.as_ref().expect("window set after ensure_window");
-            let handle = window.handle()?;
-            let raw = handle.window_handle().map_err(|e| anyhow::anyhow!("window handle: {e}"))?;
-            match raw.as_raw() {
-                aviutl2::raw_window_handle::RawWindowHandle::Win32(h) => h.hwnd.get() as isize,
-                _ => anyhow::bail!("Win32 以外のウィンドウは未対応"),
-            }
-        };
-        unsafe {
-            use windows::Win32::Foundation::HWND;
-            use windows::Win32::UI::WindowsAndMessaging::{SetForegroundWindow, ShowWindow, SW_SHOW};
-            let hwnd = HWND(hwnd as _);
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(hwnd);
-        }
-        Ok(())
-    }
-
-    fn open_window_from_menu() {
-        if let Err(e) = Self::with_instance(|plugin| plugin.open_window()) {
-            tracing::error!("色履歴を開けませんでした: {e:#}");
-        }
     }
 
     /// 編集メニュー（ショートカットを割り当てられる）。
@@ -219,7 +190,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
                 }
             }
         }
-        registry.register_edit_menu("色履歴を開く", Self::open_window_from_menu);
+        // ウィンドウは表示メニューから開く（メニューから ShowWindow しても開かない。2026-10-10 にユーザーの指摘で外した）
         registry.register_edit_menu("色履歴: 選択中オブジェクトの色を記録", Self::record_now_from_menu);
         registry.register_edit_menu("色履歴: カーソル位置の色を記録", Self::record_cursor_color_from_menu);
     }

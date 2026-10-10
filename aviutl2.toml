@@ -7,7 +7,7 @@
 [project]
 id = "HexBrowns.ColorHistory_H"
 name = "ColorHistory_H"
-version = "0.2.2"
+version = "0.2.3"
 
 [artifacts."ColorHistory_H.aux2"]
 build = "cargo build --release"
