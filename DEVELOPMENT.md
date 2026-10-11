@@ -4,7 +4,7 @@ AviUtl2 向け色履歴プラグイン（Rust 製 `.aux2`）。`PaletteHistory.a
 
 - **バージョン:** 0.2.1（aviutl2-rs 0.47）
 - **依存:** `aviutl2` / `aviutl2-eframe` **0.40**（ホスト AviUtl2 **2.1.1** 以上）
-- ユーザー向け: [`自作スクリプトマニュアル/ColorHistory_H_Manual.md`](../../../自作スクリプトマニュアル/ColorHistory_H_Manual.md)
+- ユーザー向け: [`AI/公開情報/ColorHistory_H/ColorHistory_H_Manual.md`](../../公開情報/ColorHistory_H/ColorHistory_H_Manual.md)
 
 ## ビルド
 
