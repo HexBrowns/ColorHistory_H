@@ -1,6 +1,6 @@
 [package]
 name = "color-history-h"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 license = "MIT"
 authors = ["HexBrowns"]
@@ -9,7 +9,7 @@ publish = false
 
 [lib]
 name = "color_history_h"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]  # rlib は tests/ の偽の本体のテストから呼ぶため
 
 [dependencies]
 anyhow = "1.0"
@@ -21,7 +21,10 @@ serde_json = "1.0"
 tracing = "0.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_DirectWrite",
     "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",

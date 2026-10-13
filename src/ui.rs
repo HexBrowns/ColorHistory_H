@@ -59,6 +59,8 @@ impl Default for ReplaceState {
 
 pub struct ColorHistoryApp {
     _handle: AviUtl2EframeHandle,
+    /// 本体のフォント（窓が見えてから読む。`host_fonts`）
+    host_fonts: crate::host_fonts::LazyFonts,
     shared: SharedState,
     watcher: Option<Sender<Msg>>,
     search: String,
@@ -149,10 +151,12 @@ impl ColorHistoryApp {
         cc.egui_ctx.all_styles_mut(|style| {
             style.visuals = aviutl2_eframe::aviutl2_visuals();
         });
-        cc.egui_ctx.set_fonts(aviutl2_eframe::aviutl2_fonts());
+        // 本体のフォントは窓が見えてから ui で読む（ここで読むと、本体の起動がこの窓の初期化を待つ間ずっと止まる。`host_fonts`）
+        let host_fonts = crate::host_fonts::LazyFonts::new(&handle);
         shared.write().egui_ctx = Some(cc.egui_ctx.clone());
         Self {
             _handle: handle,
+            host_fonts,
             shared,
             watcher,
             search: String::new(),
@@ -941,6 +945,10 @@ impl ColorHistoryApp {
 
 impl eframe::App for ColorHistoryApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // 本体のフォントは窓が見えてから読む。読んだフレームは描かない（新しいフォントは次のフレームから効く。次のフレームは頼んである）
+        if self.host_fonts.load_if_visible(ui.ctx()) {
+            return;
+        }
         self.update_picking(ui.ctx());
         self.handle_shortcuts(ui.ctx());
 

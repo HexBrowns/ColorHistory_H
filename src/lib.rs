@@ -1,11 +1,12 @@
 mod clipboard;
-mod color;
-mod edit_ops;
+pub mod color;
+pub mod edit_ops;
 mod eyedropper;
-mod history;
+pub mod history;
 mod input;
-mod replace;
-mod tracker;
+pub mod replace;
+pub mod tracker;
+mod host_fonts;
 mod ui;
 mod watcher;
 
@@ -84,12 +85,40 @@ fn init_logging() {
         .try_init();
 }
 
+/// 初期化にかかった時間をログに 1 行出す（強化デバッグ。仕様 `AI/specifications/20261012_CurveEditor_H_キーフレーム速度_spec.md` の 7.0）。
+/// `register` の始めに作り、`register` を抜けるとき（途中の `return` も含む）に new と register の時間を出す
+struct InitTimeLog {
+    new_time: std::time::Duration,
+    register_start: std::time::Instant,
+}
+
+impl InitTimeLog {
+    fn start(new_time: std::time::Duration) -> Self {
+        Self { new_time, register_start: std::time::Instant::now() }
+    }
+}
+
+impl Drop for InitTimeLog {
+    fn drop(&mut self) {
+        let register = self.register_start.elapsed();
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        aviutl2::tracing::info!(
+            "ColorHistory_H: 初期化 {:.1} ms（new {:.1} ms・register {:.1} ms）",
+            ms(self.new_time + register),
+            ms(self.new_time),
+            ms(register)
+        );
+    }
+}
+
 #[aviutl2::plugin(GenericPlugin)]
 pub struct ColorHistoryPlugin {
     window: Mutex<Option<aviutl2_eframe::EframeWindow>>,
     window_created: AtomicBool,
     shared: SharedState,
     watcher: Option<Watcher>,
+    /// `new` にかかった時間（初期化の時間をログに出すため。`InitTimeLog`）
+    init_new_time: std::time::Duration,
 }
 
 impl ColorHistoryPlugin {
@@ -139,6 +168,7 @@ impl ColorHistoryPlugin {
 
 impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
+        let init_t0 = std::time::Instant::now();
         init_logging();
         tracing::info!("ColorHistory_H v{} 初期化", env!("CARGO_PKG_VERSION"));
         let path = history::default_path();
@@ -161,6 +191,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
             window_created: AtomicBool::new(false),
             shared,
             watcher: None,
+            init_new_time: init_t0.elapsed(),
         })
     }
 
@@ -175,6 +206,8 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
     }
 
     fn register(&mut self, registry: &mut aviutl2::generic::HostAppHandle) {
+        // 抜けるときに初期化の時間をログに出す（`InitTimeLog`）
+        let _init_time = InitTimeLog::start(self.init_new_time);
         EDIT_HANDLE.init(registry.create_edit_handle());
         self.watcher = Some(Watcher::start(Arc::clone(&self.shared)));
 
