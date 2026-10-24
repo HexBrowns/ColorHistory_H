@@ -1,11 +1,16 @@
+mod colors;
+mod egui_input;
+mod ui_theme;
 mod clipboard;
 pub mod color;
+pub mod colorspace;
 pub mod edit_ops;
 mod eyedropper;
 pub mod history;
-mod input;
 pub mod replace;
 pub mod tracker;
+mod hexbrowns_mark;
+mod startup;
 mod host_fonts;
 mod ui;
 mod watcher;
@@ -38,14 +43,26 @@ pub struct AppState {
     /// フォーカス中オブジェクトの色項目（適用先の候補）。未選択なら `None`
     pub focused: Option<Vec<ColorItem>>,
     pub status: String,
+    /// 状態の行の種類（色分け）。`say` で文言と一緒に決める
+    pub status_kind: ui_theme::StatusKind,
     pub egui_ctx: Option<egui::Context>,
     /// 起動時に履歴ファイルを読めず、退避もできなかった。この起動の間は保存しない
     /// （読めなかったファイルを、空から始めた履歴で上書きしない）
     pub save_blocked: bool,
+    /// 履歴か設定を変えるたびに増える番号（ウィンドウが並べ替えた結果を覚えておき、変わったときだけ並べ直す）
+    pub revision: u64,
 }
 
 impl AppState {
+    /// 状態の行に出す文と種類を決める
+    pub fn say(&mut self, kind: ui_theme::StatusKind, msg: impl Into<String>) {
+        self.status = msg.into();
+        self.status_kind = kind;
+    }
+
     pub fn mark_dirty(&mut self) {
+        // 保存しない間も中身は変わるので、並べ直しの印は必ず進める
+        self.revision = self.revision.wrapping_add(1);
         // 保存しない間は未保存の印も付けない（保存を試みず、監視スレッドも短い間隔で回らない）
         if self.save_blocked {
             return;
@@ -63,6 +80,42 @@ impl AppState {
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
+
+/// 本体が自分で書く写し（`Backup\AutoBackup_*.aup2`・終了時の `resume.aup2` / `restart.aup2`）か。
+/// これらの保存でも `on_project_save` が来ることがあるので、開いているプロジェクトの名前と取り違えない（推論。本体 2.1.14 のログに保存の行がある）
+fn is_host_copy(path: &std::path::Path) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let in_backup = path.parent().and_then(|d| d.file_name()).is_some_and(|d| d.eq_ignore_ascii_case("Backup"));
+    in_backup || name == "resume.aup2" || name == "restart.aup2"
+}
+
+/// プロジェクトとして扱うパス。本体の写し（`is_host_copy`）なら、中の `[project]` の `file=` に書かれた元のプロジェクト（空なら None = 未保存）。
+/// 本体は起動時に resume.aup2 を開くので、そのままだと前回のプロジェクトが「resume.aup2 という知らないプロジェクト」になる（2026-10-24 のログ）
+fn real_project_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if !is_host_copy(path) {
+        return Some(path.to_path_buf());
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    project_file_of(&text).map(std::path::PathBuf::from)
+}
+
+/// `.aup2` の `[project]` の節の `file=` の値（空なら None）
+fn project_file_of(text: &str) -> Option<String> {
+    let mut in_project = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_project = line == "[project]";
+            continue;
+        }
+        if in_project {
+            if let Some(v) = line.strip_prefix("file=") {
+                return Some(v.trim().to_string()).filter(|v| !v.is_empty());
+            }
+        }
+    }
+    None
+}
 
 fn init_logging() {
     use aviutl2::tracing::Level;
@@ -130,7 +183,7 @@ impl ColorHistoryPlugin {
         if guard.is_none() {
             let shared = Arc::clone(&self.shared);
             let sender = self.watcher.as_ref().map(|w| w.sender());
-            *guard = Some(aviutl2_eframe::EframeWindow::new(WINDOW_NAME, move |cc, handle| {
+            *guard = Some(startup::window(WINDOW_NAME, move |cc, handle| {
                 Ok(Box::new(ui::ColorHistoryApp::new(cc, handle, shared, sender)))
             })?);
         }
@@ -157,9 +210,12 @@ impl ColorHistoryPlugin {
                 Some((color, _)) => {
                     s.store.record(color, "スポイト", now_secs());
                     s.mark_dirty();
-                    s.status = format!("カーソル位置の色 {} を記録しました", color.hex());
+                    s.say(ui_theme::StatusKind::Ok, format!("カーソル位置の色 {} を記録しました", color.hex()));
                 }
-                None => s.status = "カーソル位置の色を読めませんでした".into(),
+                None => s.say(
+                    ui_theme::StatusKind::Error,
+                    "カーソル位置の色を読めませんでした。画面に表示されている場所にカーソルを置いて、もう一度試してください",
+                ),
             }
             s.request_repaint();
         });
@@ -170,6 +226,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
     fn new(_info: aviutl2::AviUtl2Info) -> AnyResult<Self> {
         let init_t0 = std::time::Instant::now();
         init_logging();
+        startup::kick_siblings();
         tracing::info!("ColorHistory_H v{} 初期化", env!("CARGO_PKG_VERSION"));
         let path = history::default_path();
         let history::Loaded { store, warning, save_blocked } = history::load(&path);
@@ -177,6 +234,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
             tracing::warn!("ColorHistory_H: {w}");
         }
         let shared = Arc::new(RwLock::new(AppState {
+            status_kind: if warning.is_some() { ui_theme::StatusKind::Warn } else { ui_theme::StatusKind::Info },
             status: warning.unwrap_or_default(),
             store,
             path,
@@ -185,6 +243,7 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
             focused: None,
             egui_ctx: None,
             save_blocked,
+            revision: 0,
         }));
         Ok(Self {
             window: Mutex::new(None),
@@ -232,14 +291,38 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
     }
 
     fn on_project_load(&mut self, project: &mut aviutl2::generic::ProjectFile) {
-        self.shared.write().project_path = project.get_path();
+        // 本体の写し（起動時の resume.aup2・バックアップ）は、中に書かれた元のプロジェクトとして扱う（書かれていなければ未保存）
+        let path = project.get_path().and_then(|p| real_project_path(&p));
+        let mut s = self.shared.write();
+        // 記録先: このプロジェクトで最後に選んだリスト → 名前の合うリスト → デフォルト（history.rs の open_project）
+        let o = s.store.open_project(path.as_deref());
+        let name = s.store.active_list().name.clone();
+        // 変わらなかったときも 1 行出す（切り替わらないと言われたとき、どう決めたかをログで追えるように）
+        tracing::info!(
+            "ColorHistory_H: プロジェクトを開いた（{}）。記録先は「{name}」（{}{}）",
+            if path.is_some() { "保存済み" } else { "未保存" },
+            o.reason.text(),
+            if o.changed { "。切り替えた" } else { "。そのまま" }
+        );
+        if o.changed {
+            s.say(ui_theme::StatusKind::Info, format!("記録先を「{name}」にしました（{}）", o.reason.text()));
+            s.request_repaint();
+        }
+        if o.changed || o.reason == history::OpenReason::NameMatched {
+            s.mark_dirty();
+        }
+        s.project_path = path;
     }
 
     fn on_project_save(&mut self, project: &mut aviutl2::generic::ProjectFile) {
         // 履歴はプロジェクトではなく専用ファイルに保存する。プロジェクト保存の機会にも書き出しておく
         let (store, path, dirty) = {
             let mut s = self.shared.write();
-            if let Some(p) = project.get_path() {
+            if let Some(p) = project.get_path().filter(|p| !is_host_copy(p)) {
+                // 新規を初めて保存した・別名で保存したときは、今の記録先をその名前で覚える
+                if s.store.project_saved(&p) {
+                    s.mark_dirty();
+                }
                 s.project_path = Some(p);
             }
             (s.store.clone(), s.path.clone(), s.dirty_since.is_some() && !s.save_blocked)
@@ -266,3 +349,35 @@ impl aviutl2::generic::GenericPlugin for ColorHistoryPlugin {
 }
 
 aviutl2::register_generic_plugin!(ColorHistoryPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::is_host_copy;
+    use std::path::Path;
+
+    #[test]
+    fn host_copies_are_not_taken_as_the_project() {
+        assert!(is_host_copy(Path::new(r"C:\ProgramData\aviutl2\Backup\AutoBackup_2026-10-24_07-18-37-446.aup2")));
+        assert!(is_host_copy(Path::new(r"C:\ProgramData\aviutl2\resume.aup2")));
+        assert!(!is_host_copy(Path::new(r"D:\Videos\作品A\作品A.aup2")));
+    }
+}
+
+#[cfg(test)]
+mod project_path_tests {
+    use super::*;
+
+    /// 本体の写しは中の元のプロジェクトとして扱う（resume.aup2 の file= が空なら未保存）
+    #[test]
+    fn host_copies_use_the_original_project() {
+        assert_eq!(project_file_of("[project]\nversion=2011500\nfile=D:/a/b.aup2\n[scene.0]\nfile=x\n").as_deref(), Some("D:/a/b.aup2"));
+        assert_eq!(project_file_of("[project]\nfile=\n"), None);
+        assert_eq!(project_file_of("[scene.0]\nfile=x\n"), None, "[project] の外の file= は見ない");
+        assert!(is_host_copy(std::path::Path::new(r"C:\ProgramData\aviutl2\resume.aup2")));
+        let p = std::path::Path::new(r"D:\Videos\a.aup2");
+        assert_eq!(real_project_path(p).as_deref(), Some(p), "写しでなければそのまま");
+    }
+}
+
+// 本体が読み込む前に、兄弟のプラグインがこの窓を先に作れるようにする（startup.rs）
+export_prewarm!(WINDOW_NAME);

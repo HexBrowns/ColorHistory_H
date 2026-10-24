@@ -6,6 +6,7 @@
 //! 履歴は複数の「リスト」を持てる。最初は「デフォルト」だけで、利用者が作ったリストを
 //! 選んでいる間は、記録した色がそのリストにだけ入る（v0.2.0〜）。
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::color::{CopyFormat, Rgb};
+use crate::colorspace::{hue_sort_key, ColorMetric, HueSpace};
 
 /// 1: v0.1.0（単一の履歴） / 2: v0.2.0（リスト）
 pub const FILE_VERSION: u32 = 2;
@@ -86,6 +88,12 @@ pub struct Settings {
     /// 色見本 1 個の大きさ（px）
     #[serde(default = "default_swatch_size")]
     pub swatch_size: f32,
+    /// 色相順の色空間（v0.4.0〜。無ければ今までの HSV）
+    #[serde(default, deserialize_with = "default_if_unknown")]
+    pub hue_space: HueSpace,
+    /// 一括置換の色差（v0.4.0〜。無ければ今までの各成分の差）
+    #[serde(default, deserialize_with = "default_if_unknown")]
+    pub replace_metric: ColorMetric,
 }
 
 /// 列挙の項目を読む。知らない値（新しい版が足した並び順・コピー形式）は、その項目だけ初期値にする。
@@ -123,6 +131,8 @@ impl Default for Settings {
             copy_format: CopyFormat::Plain,
             sort: SortMode::Recent,
             swatch_size: default_swatch_size(),
+            hue_space: HueSpace::Hsv,
+            replace_metric: ColorMetric::PerChannel,
         }
     }
 }
@@ -249,10 +259,11 @@ impl ColorList {
     }
 
     /// 表示用の並び。`(ピン留め, それ以外)` を返す。検索語はカラーコード（`#` 等の有無は問わない）かラベルの部分一致。
-    pub fn view(&self, sort: SortMode, query: &str) -> (Vec<&Entry>, Vec<&Entry>) {
+    /// `hue_space` は色相順のときだけ使う。
+    pub fn view(&self, sort: SortMode, hue_space: HueSpace, query: &str) -> (Vec<&Entry>, Vec<&Entry>) {
         let q = normalize_query(query);
         let mut items: Vec<&Entry> = self.entries.iter().filter(|e| matches_query(e, &q)).collect();
-        sort_entries(&mut items, sort);
+        sort_entries(&mut items, sort, hue_space);
         items.into_iter().partition(|e| e.pinned)
     }
 }
@@ -269,6 +280,13 @@ pub struct Store {
     pub active: String,
     #[serde(default)]
     pub settings: Settings,
+    /// プロジェクトごとに最後に選んだリスト（`.aup2` のパスの鍵 → リストの id）。デフォルトを選んだプロジェクトは載せない（v0.5.0〜）。
+    /// 載っていないプロジェクト（新規・知らないもの）を開いたら、記録先をデフォルトにする（ユーザーの指示、2026-10-24）
+    #[serde(default)]
+    pub project_lists: BTreeMap<String, String>,
+    /// 開いているプロジェクトの鍵（未保存なら None）。書き出さない
+    #[serde(skip)]
+    current_project: Option<String>,
     /// v0.1.0 の形式（トップレベルの entries）を読むためだけの欄。書き出さない
     #[serde(default, skip_serializing)]
     entries: Vec<Entry>,
@@ -281,6 +299,8 @@ impl Default for Store {
             lists: Vec::new(),
             active: DEFAULT_LIST_ID.into(),
             settings: Settings::default(),
+            project_lists: BTreeMap::new(),
+            current_project: None,
             entries: Vec::new(),
         };
         s.normalize();
@@ -345,6 +365,7 @@ impl Store {
     pub fn set_active(&mut self, id: &str) -> bool {
         if self.lists.iter().any(|l| l.id == id) {
             self.active = id.into();
+            self.remember_project_list();
             true
         } else {
             false
@@ -363,6 +384,7 @@ impl Store {
         let name = self.unique_name(name.trim());
         self.lists.push(ColorList::new(&id, &name, now));
         self.active = id.clone();
+        self.remember_project_list();
         id
     }
 
@@ -404,6 +426,7 @@ impl Store {
         if self.active == id {
             self.active = DEFAULT_LIST_ID.into();
         }
+        self.project_lists.retain(|_, l| l != id);
         Some(removed)
     }
 
@@ -428,6 +451,70 @@ impl Store {
         }
     }
 
+    /// プロジェクトを開いた。記録先を次の順で決める（ユーザーの ToDo「新規や知らないプロジェクトは既定のリスト」）:
+    /// 1. このプロジェクトで最後に選んだリスト（デフォルトを選んだことも覚えている）
+    /// 2. 名前がプロジェクトのファイル名かフォルダ名の頭と合うリスト（「マリンブルー・マジック♡」のリストと `マリンブルー・マジック♡_New.aup2`。
+    ///    いちばん長く合うもの）。合ったらそのプロジェクトの記録先として覚える（選ばずに開いただけで切り替わらなかった。2026-10-24）
+    /// 3. どれも無ければ（新規・知らないプロジェクト・消したリスト）デフォルト
+    pub fn open_project(&mut self, path: Option<&Path>) -> OpenOutcome {
+        self.current_project = path.map(project_key);
+        let remembered = self
+            .current_project
+            .as_ref()
+            .and_then(|k| self.project_lists.get(k))
+            .filter(|id| self.lists.iter().any(|l| &l.id == *id))
+            .cloned();
+        let (want, reason) = match (remembered, path.and_then(|p| self.list_matching_project(p))) {
+            (Some(id), _) => (id, OpenReason::Remembered),
+            (None, Some(id)) => (id, OpenReason::NameMatched),
+            (None, None) => (DEFAULT_LIST_ID.to_string(), if path.is_some() { OpenReason::Unknown } else { OpenReason::Unsaved }),
+        };
+        let changed = self.active != want;
+        self.active = want;
+        if reason == OpenReason::NameMatched {
+            self.remember_project_list();
+        }
+        OpenOutcome { changed, reason }
+    }
+
+    /// 名前がプロジェクトのファイル名かフォルダ名の頭と合うリスト（デフォルトは除く。比べる前に全角と半角・大文字と小文字をそろえる）
+    fn list_matching_project(&self, path: &Path) -> Option<String> {
+        let norm = |s: &str| crate::egui_input::normalize_for_search(s.trim());
+        let names: Vec<String> = [path.file_stem(), path.parent().and_then(|d| d.file_name())]
+            .into_iter()
+            .flatten()
+            .map(|n| norm(&n.to_string_lossy()))
+            .filter(|n| !n.is_empty())
+            .collect();
+        self.lists
+            .iter()
+            .filter(|l| !l.is_default())
+            .filter_map(|l| {
+                let ln = norm(&l.name);
+                (!ln.is_empty() && names.iter().any(|n| n.starts_with(&ln))).then(|| (ln.chars().count(), l.id.clone()))
+            })
+            .max_by_key(|(len, _)| *len)
+            .map(|(_, id)| id)
+    }
+
+    /// プロジェクトを保存した。新規を初めて保存した・別名で保存したときは、今の記録先をその名前で覚える。覚えを変えたら true
+    pub fn project_saved(&mut self, path: &Path) -> bool {
+        let key = project_key(path);
+        if self.current_project.as_deref() == Some(key.as_str()) {
+            return false;
+        }
+        self.current_project = Some(key);
+        self.remember_project_list();
+        true
+    }
+
+    /// 開いているプロジェクトの記録先として今のリストを覚える（未保存のプロジェクトでは覚えない）。
+    /// デフォルトを選んだことも覚える（覚えないと、次に開いたとき名前の合うリストへ戻ってしまう）
+    fn remember_project_list(&mut self) {
+        let Some(k) = self.current_project.clone() else { return };
+        self.project_lists.insert(k, self.active.clone());
+    }
+
     pub fn apply_limit(&mut self) {
         let max = self.settings.max_entries;
         for l in &mut self.lists {
@@ -436,8 +523,45 @@ impl Store {
     }
 }
 
+/// プロジェクトを開いたときの記録先の決まり方（ログと画面に出す）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenReason {
+    /// このプロジェクトで最後に選んだリスト
+    Remembered,
+    /// 名前がプロジェクトの名前と合うリスト
+    NameMatched,
+    /// 知らないプロジェクト → デフォルト
+    Unknown,
+    /// 未保存（新規）→ デフォルト
+    Unsaved,
+}
+
+impl OpenReason {
+    pub fn text(self) -> &'static str {
+        match self {
+            OpenReason::Remembered => "このプロジェクトで最後に選んだリスト",
+            OpenReason::NameMatched => "名前がプロジェクトと合うリスト",
+            OpenReason::Unknown => "初めてのプロジェクトなのでデフォルト",
+            OpenReason::Unsaved => "未保存のプロジェクトなのでデフォルト",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOutcome {
+    /// 記録先が変わった
+    pub changed: bool,
+    pub reason: OpenReason,
+}
+
+/// プロジェクトの覚えの鍵（Windows のパスは大文字と小文字を区別しないので小文字にし、区切りを `\` にそろえる）
+pub fn project_key(path: &Path) -> String {
+    path.to_string_lossy().replace('/', "\\").to_lowercase()
+}
+
+/// 検索語を、項目と同じ形（全角と半角・大文字と小文字・ひらがなとカタカナ）にそろえてから、カラーコードの飾りを外す
 fn normalize_query(query: &str) -> String {
-    let q = query.trim().to_lowercase();
+    let q = crate::egui_input::normalize_for_search(query.trim());
     let q = q.strip_prefix("<#").map(|s| s.trim_end_matches('>')).unwrap_or(&q);
     let q = q.strip_prefix('#').unwrap_or(q);
     let q = q.strip_prefix("0x").unwrap_or(q);
@@ -448,14 +572,14 @@ fn matches_query(e: &Entry, q: &str) -> bool {
     if q.is_empty() {
         return true;
     }
-    if e.color.hex().contains(q) || e.label.to_lowercase().contains(q) {
+    if e.color.hex().contains(q) || crate::egui_input::normalize_for_search(&e.label).contains(q) {
         return true;
     }
     // "255,128,0" のような入力は色として一致を見る
     Rgb::parse(q).is_some_and(|c| c == e.color)
 }
 
-fn sort_entries(items: &mut [&Entry], sort: SortMode) {
+fn sort_entries(items: &mut Vec<&Entry>, sort: SortMode, hue_space: HueSpace) {
     match sort {
         SortMode::Recent => items.sort_by(|a, b| b.last_used.cmp(&a.last_used)),
         SortMode::Frequent => items.sort_by(|a, b| {
@@ -463,18 +587,18 @@ fn sort_entries(items: &mut [&Entry], sort: SortMode) {
                 .cmp(&a.use_count)
                 .then(b.last_used.cmp(&a.last_used))
         }),
-        SortMode::Hue => items.sort_by(|a, b| {
-            let key = |e: &Entry| {
-                let (h, s, v) = e.color.hsv();
-                // 彩度の低い色は色相が意味を持たないので後ろにまとめ、明るい順に並べる
-                let achromatic = s < 0.12 || v < 0.08;
-                (achromatic, if achromatic { -v } else { h }, -v)
-            };
-            let (ka, kb) = (key(a), key(b));
-            ka.0.cmp(&kb.0)
-                .then(ka.1.total_cmp(&kb.1))
-                .then(ka.2.total_cmp(&kb.2))
-        }),
+        SortMode::Hue => {
+            // 鍵は色ごとに 1 回だけ計算する（比較のたびに変換しない）。安定な並べ替えなので、同じ鍵は元の順のまま
+            let mut keyed: Vec<((bool, f32, f32), &Entry)> =
+                items.iter().map(|e| (hue_sort_key(e.color, hue_space), *e)).collect();
+            keyed.sort_by(|(ka, _), (kb, _)| {
+                ka.0.cmp(&kb.0)
+                    .then(ka.1.total_cmp(&kb.1))
+                    .then(ka.2.total_cmp(&kb.2))
+            });
+            items.clear();
+            items.extend(keyed.into_iter().map(|(_, e)| e));
+        }
     }
 }
 
@@ -606,12 +730,27 @@ mod tests {
         l.record(rgb(0x0080ff), "", 2, 500);
         l.set_pinned(rgb(0xff8000), true, 500);
         l.set_label(rgb(0x0080ff), "  空の青  ");
-        let (pins, rest) = l.view(SortMode::Recent, "");
+        let (pins, rest) = l.view(SortMode::Recent, HueSpace::Hsv, "");
         assert_eq!((pins.len(), rest.len()), (1, 1));
         assert_eq!(rest[0].label, "空の青");
-        assert_eq!(l.view(SortMode::Recent, "#FF80").0.len(), 1);
-        assert_eq!(l.view(SortMode::Recent, "空").1.len(), 1);
-        assert_eq!(l.view(SortMode::Recent, "0,128,255").1.len(), 1);
+        assert_eq!(l.view(SortMode::Recent, HueSpace::Hsv, "#FF80").0.len(), 1);
+        assert_eq!(l.view(SortMode::Recent, HueSpace::Hsv, "空").1.len(), 1);
+        assert_eq!(l.view(SortMode::Recent, HueSpace::Hsv, "0,128,255").1.len(), 1);
+    }
+
+    #[test]
+    fn view_search_ignores_width_case_and_kana() {
+        let mut l = ColorList::new("x", "x", 0);
+        l.record(rgb(0xff8000), "", 1, 500);
+        l.record(rgb(0x0080ff), "", 2, 500);
+        l.set_label(rgb(0x0080ff), "ブルー Sky");
+        let n = |q: &str| l.view(SortMode::Recent, HueSpace::Hsv, q).1.len();
+        assert_eq!(n("ＦＦ８０"), 1, "全角のカラーコード");
+        assert_eq!(n("ぶるー"), 1, "ひらがなでカタカナのラベル");
+        assert_eq!(n("ﾌﾞﾙｰ"), 1, "半角カナ");
+        assert_eq!(n("ＳＫＹ"), 1, "全角の英字");
+        assert_eq!(n("０，１２８，２５５"), 1, "全角の 255,128,0 形式");
+        assert_eq!(n("zzz"), 0);
     }
 
     #[test]
@@ -624,9 +763,111 @@ mod tests {
         l.record(rgb(0x0000ff), "", 5, 500);
         l.record(rgb(0x0000ff), "", 6, 500);
         let hexes = |v: Vec<&Entry>| v.iter().map(|e| e.color.hex()).collect::<Vec<_>>();
-        assert_eq!(hexes(l.view(SortMode::Recent, "").1), ["0000ff", "00ff00", "808080", "ff0000"]);
-        assert_eq!(hexes(l.view(SortMode::Frequent, "").1)[0], "0000ff");
-        assert_eq!(hexes(l.view(SortMode::Hue, "").1), ["ff0000", "00ff00", "0000ff", "808080"]);
+        assert_eq!(hexes(l.view(SortMode::Recent, HueSpace::Hsv, "").1), ["0000ff", "00ff00", "808080", "ff0000"]);
+        assert_eq!(hexes(l.view(SortMode::Frequent, HueSpace::Hsv, "").1)[0], "0000ff");
+        assert_eq!(hexes(l.view(SortMode::Hue, HueSpace::Hsv, "").1), ["ff0000", "00ff00", "0000ff", "808080"]);
+    }
+
+    /// 決まった種から色を作る（同じ色・灰色・暗い色も混ぜる）
+    fn sample_list(n: usize) -> ColorList {
+        let mut l = ColorList::new("x", "x", 0);
+        let mut seed = 0x9e3779b9u32;
+        for i in 0..n {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let c = match i % 7 {
+                0 => {
+                    let v = (seed & 0xff) as u8;
+                    Rgb::new(v, v, v)
+                }
+                1 => rgb(seed & 0x1f1f1f),
+                _ => rgb(seed & 0xffffff),
+            };
+            l.record(c, "", i as u64, MAX_ENTRIES_MAX);
+        }
+        l
+    }
+
+    /// v0.3.1 の色相順をそのまま写したもの（比較のたびに HSV を計算する）
+    fn sort_hue_v031(items: &mut [&Entry]) {
+        items.sort_by(|a, b| {
+            let key = |e: &Entry| {
+                let (h, s, v) = e.color.hsv();
+                let achromatic = s < 0.12 || v < 0.08;
+                (achromatic, if achromatic { -v } else { h }, -v)
+            };
+            let (ka, kb) = (key(a), key(b));
+            ka.0.cmp(&kb.0).then(ka.1.total_cmp(&kb.1)).then(ka.2.total_cmp(&kb.2))
+        });
+    }
+
+    /// 既定（HSV）の色相順は v0.3.1 と同じ並び（同じ鍵の色の順も含めて）
+    #[test]
+    fn default_hue_sort_matches_v031() {
+        let l = sample_list(3000);
+        assert!(l.entries.len() > 2500);
+        let mut old: Vec<&Entry> = l.entries.iter().collect();
+        sort_hue_v031(&mut old);
+        let (pins, rest) = l.view(SortMode::Hue, HueSpace::default(), "");
+        assert!(pins.is_empty());
+        let colors = |v: &[&Entry]| v.iter().map(|e| e.color).collect::<Vec<_>>();
+        assert_eq!(colors(&rest), colors(&old));
+    }
+
+    /// Oklch の色相順: 有彩色は Oklch の色相が増える順、無彩色（C・L が小さい）は後ろに明るい順
+    #[test]
+    fn oklch_hue_sort_follows_oklch_hue() {
+        let l = sample_list(2000);
+        let (_, rest) = l.view(SortMode::Hue, HueSpace::Oklch, "");
+        assert_eq!(rest.len(), l.entries.len());
+        let lch: Vec<[f64; 3]> = rest.iter().map(|e| crate::colorspace::oklch(e.color)).collect();
+        let achromatic = |c: &[f64; 3]| c[1] < 0.025 || c[0] < 0.19;
+        let first_gray = lch.iter().position(achromatic).expect("灰色がある");
+        assert!(first_gray > 0, "有彩色がある");
+        assert!(lch[first_gray..].iter().all(achromatic), "無彩色は後ろにまとまる");
+        assert!(lch[..first_gray].windows(2).all(|w| w[0][2] <= w[1][2] + 1e-4), "有彩色は Oklch の色相の順");
+        assert!(lch[first_gray..].windows(2).all(|w| w[0][0] >= w[1][0] - 1e-4), "無彩色は明るい順");
+        // HSV の並びとは違う（青紫やピンクの位置が変わる）
+        let (_, hsv) = l.view(SortMode::Hue, HueSpace::Hsv, "");
+        assert_ne!(rest.iter().map(|e| e.color).collect::<Vec<_>>(), hsv.iter().map(|e| e.color).collect::<Vec<_>>());
+    }
+
+    /// v0.3.1 が書いた履歴ファイル（`tests/fixtures/history_v0.3.1.json`）は、足した設定を既定にして読む
+    #[test]
+    fn reads_v031_file_with_new_settings_at_default() {
+        let text = include_str!("../tests/fixtures/history_v0.3.1.json");
+        let mut s: Store = serde_json::from_str(text).expect("v0.3.1 の履歴を読める");
+        s.normalize();
+        assert_eq!(s.settings.hue_space, HueSpace::Hsv, "色相順は今までの HSV のまま");
+        assert_eq!(s.settings.replace_metric, ColorMetric::PerChannel, "置換は今までの各成分の差のまま");
+        // 既にあった設定・履歴はそのまま
+        assert_eq!(s.settings.sort, SortMode::Hue);
+        assert_eq!(s.settings.copy_format, CopyFormat::Hash);
+        assert!(!s.settings.auto_record);
+        assert_eq!((s.settings.max_entries, s.settings.swatch_size), (300, 32.0));
+        assert_eq!(s.active, "list-1791015201");
+        assert_eq!(s.lists.len(), 2);
+        assert_eq!(s.lists[0].entries.len(), 2);
+        // 書き出すと新しい欄が足される。読み直しても同じ
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["settings"]["hue_space"], "Hsv");
+        assert_eq!(v["settings"]["replace_metric"], "PerChannel");
+        let back: Store = serde_json::from_value(v).unwrap();
+        assert_eq!(back, s);
+    }
+
+    /// 新しい設定の値を知らない値（さらに新しい版が足した色差など）で読んでも、その項目だけ既定にする
+    #[test]
+    fn unknown_color_settings_fall_back_per_field() {
+        let newer = r#"{"auto_record":false,"hue_space":"Cam16","replace_metric":{"Jzazbz":2},"sort":"Hue"}"#;
+        let s: Settings = serde_json::from_str(newer).unwrap();
+        assert_eq!(s.hue_space, HueSpace::Hsv);
+        assert_eq!(s.replace_metric, ColorMetric::PerChannel);
+        assert_eq!(s.sort, SortMode::Hue);
+        assert!(!s.auto_record);
+        let known: Settings = serde_json::from_str(r#"{"hue_space":"Oklch","replace_metric":"Ciede2000"}"#).unwrap();
+        assert_eq!((known.hue_space, known.replace_metric), (HueSpace::Oklch, ColorMetric::Ciede2000));
     }
 
     #[test]
@@ -815,5 +1056,72 @@ mod tests {
         assert_eq!((known.copy_format, known.sort), (CopyFormat::Lua, SortMode::Hue));
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing, Settings::default());
+    }
+
+    /// 新規・知らないプロジェクトはデフォルトに記録し、選んだリストはプロジェクトごとに覚える（ユーザーの指示、2026-10-24）
+    #[test]
+    fn a_list_named_like_the_project_is_picked_and_remembered() {
+        let mut s = Store::default();
+        let short = s.create_list("マリンブルー", 1);
+        let long = s.create_list("マリンブルー・マジック♡", 2);
+        s.set_active(DEFAULT_LIST_ID);
+        let p = Path::new(r"D:\Videos\動画編集\マリンブルー・マジック♡\マリンブルー・マジック♡_New.aup2");
+        let o = s.open_project(Some(p));
+        assert_eq!((o.changed, o.reason, s.active.as_str()), (true, OpenReason::NameMatched, long.as_str()), "いちばん長く合うリスト");
+        assert_eq!(s.project_lists.get(&project_key(p)), Some(&long), "合ったら覚える");
+        // 覚えた後に選び直したら、そちらが勝つ（デフォルトを選んでも）
+        s.set_active(DEFAULT_LIST_ID);
+        s.open_project(None);
+        assert_eq!(s.open_project(Some(p)).reason, OpenReason::Remembered);
+        assert_eq!(s.active, DEFAULT_LIST_ID);
+        // フォルダ名でも合う。合わなければデフォルト
+        let q = Path::new(r"D:\Videos\マリンブルー\本編.aup2");
+        assert_eq!(s.open_project(Some(q)).reason, OpenReason::NameMatched);
+        assert_eq!(s.active, short);
+        let o = s.open_project(Some(Path::new(r"D:\Videos\別\別.aup2")));
+        assert_eq!((o.reason, s.active.as_str()), (OpenReason::Unknown, DEFAULT_LIST_ID));
+        assert_eq!(s.open_project(None).reason, OpenReason::Unsaved);
+    }
+
+    #[test]
+    fn each_project_remembers_its_list_and_unknown_ones_use_default() {
+        let a = Path::new(r"D:\Videos\作品A\作品A.aup2");
+        let b = Path::new(r"D:\Videos\作品B\作品B.aup2");
+        let mut s = Store::default();
+        s.open_project(Some(a));
+        let la = s.create_list("作品A の色", 1);
+        assert_eq!(s.active, la);
+        // 知らないプロジェクト → デフォルト
+        assert!(s.open_project(Some(b)).changed);
+        assert_eq!(s.active, DEFAULT_LIST_ID);
+        // 新規（未保存）→ デフォルト。そこで選んでも、保存するまでは覚えない
+        s.open_project(Some(a));
+        assert_eq!(s.active, la, "作品A に戻ると、作品A で選んだリスト");
+        s.open_project(None);
+        assert_eq!(s.active, DEFAULT_LIST_ID);
+        let ln = s.create_list("新規の色", 2);
+        assert!(s.project_lists.values().all(|v| v != &ln), "未保存のプロジェクトでは覚えない");
+        // 新規を保存したら、選んでいたリストをその名前で覚える
+        let c = Path::new(r"D:\Videos\作品C\作品C.aup2");
+        assert!(s.project_saved(c));
+        s.open_project(Some(b));
+        s.open_project(Some(Path::new(r"d:/videos/作品c/作品C.aup2")));
+        assert_eq!(s.active, ln, "大文字と小文字・区切りが違っても同じプロジェクト");
+        // デフォルトを選び直したら覚えを外す。リストを消したら、そのリストの覚えも外れる
+        s.open_project(Some(a));
+        s.set_active(DEFAULT_LIST_ID);
+        assert_eq!(s.project_lists.get(&project_key(a)).map(|s| s.as_str()), Some(DEFAULT_LIST_ID), "デフォルトを選んだことも覚える");
+        s.delete_list(&ln);
+        assert!(s.project_lists.values().all(|v| v != &ln), "消したリストの覚えは外れる");
+        s.open_project(Some(c));
+        assert_eq!(s.active, DEFAULT_LIST_ID);
+        // 書き出して読み直しても覚えは残る。前の版のファイル（覚えの欄が無い）も読める
+        s.open_project(Some(a));
+        s.set_active(&la);
+        let text = serde_json::to_string(&s).unwrap();
+        let back: Store = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.project_lists.get(&project_key(a)), Some(&la));
+        let old: Store = serde_json::from_str(r#"{"version":2,"lists":[],"active":"default"}"#).unwrap();
+        assert!(old.project_lists.is_empty());
     }
 }

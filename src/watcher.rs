@@ -127,11 +127,14 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
                                 count += 1;
                             }
                         }
-                        s.status = if count > 0 {
-                            format!("選択中オブジェクトの色を {count} 件記録しました")
+                        if count > 0 {
+                            s.say(crate::ui_theme::StatusKind::Ok, format!("選択中オブジェクトの色を {count} 件記録しました"));
                         } else {
-                            "選択中オブジェクトに色の項目がありません".into()
-                        };
+                            s.say(
+                                crate::ui_theme::StatusKind::Warn,
+                                "選択中オブジェクトに色の項目がありません。色の項目を持つ効果のあるオブジェクトを選んでください",
+                            );
+                        }
                         if count > 0 {
                             s.mark_dirty();
                         }
@@ -149,7 +152,7 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
                     let changed = record_now || s.focused.is_some();
                     if record_now {
                         record_now = false;
-                        s.status = "オブジェクトが選択されていません".into();
+                        s.say(crate::ui_theme::StatusKind::Warn, "オブジェクトが選択されていません。タイムラインでオブジェクトを選んでから押してください");
                     }
                     s.focused = None;
                     if changed {
@@ -161,7 +164,10 @@ fn run(rx: Receiver<Msg>, shared: SharedState) {
                     tracing::debug!(error = %e, "read_focused_colors failed");
                     if record_now {
                         record_now = false;
-                        shared.write().status = format!("色を読めませんでした: {e}");
+                        shared.write().say(
+                            crate::ui_theme::StatusKind::Error,
+                            format!("色を読めませんでした: {e}。オブジェクトを選び直してもう一度試してください"),
+                        );
                     }
                 }
             }
@@ -206,7 +212,10 @@ fn save_if_dirty(shared: &SharedState, force: bool) {
         Err(e) => {
             tracing::warn!(error = %e, path = %path.display(), "ColorHistory_H: 履歴の保存に失敗");
             let mut s = shared.write();
-            s.status = format!("履歴を保存できませんでした: {e}");
+            s.say(
+                crate::ui_theme::StatusKind::Error,
+                format!("履歴を保存できませんでした: {e}。履歴ファイルの置き場所に書き込めるか確認してください（しばらくしてから自動で再試行します）"),
+            );
             // 失敗し続けてもログを埋めないよう、次の試行は時間を置く
             s.dirty_since = Some(Instant::now());
         }

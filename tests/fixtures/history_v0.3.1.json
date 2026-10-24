@@ -1,0 +1,54 @@
+{
+  "version": 2,
+  "lists": [
+    {
+      "id": "default",
+      "name": "デフォルト",
+      "created": 0,
+      "entries": [
+        {
+          "color": "000000",
+          "label": "",
+          "pinned": false,
+          "use_count": 18,
+          "first_used": 1789283833,
+          "last_used": 1791585043,
+          "last_source": "テキスト / 影・縁色"
+        },
+        {
+          "color": "ff8000",
+          "label": "強調",
+          "pinned": true,
+          "use_count": 3,
+          "first_used": 1789283900,
+          "last_used": 1791585000,
+          "last_source": "図形 / 色"
+        }
+      ]
+    },
+    {
+      "id": "list-1791015201",
+      "name": "案件",
+      "created": 1791015201,
+      "entries": [
+        {
+          "color": "1a2a5e",
+          "label": "",
+          "pinned": false,
+          "use_count": 1,
+          "first_used": 1791015300,
+          "last_used": 1791015300,
+          "last_source": "スポイト"
+        }
+      ]
+    }
+  ],
+  "active": "list-1791015201",
+  "settings": {
+    "auto_record": false,
+    "max_entries": 300,
+    "copy_format": "Hash",
+    "sort": "Hue",
+    "swatch_size": 32.0
+  }
+}

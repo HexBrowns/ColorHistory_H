@@ -1,6 +1,8 @@
 //! プロジェクト内の色の検索と一括置換
 //!
-//! - **しきい値**: RGB の各成分の差が N 以下なら同じ色とみなす（N=0 は完全一致）
+//! - **しきい値**: 8bit の段数 N。既定の「各成分の差」は RGB の各成分の差が N 以下なら同じ色とみなす（N=0 は完全一致）。
+//!   色差（RGB・YCbCr・Oklab・CIEDE2000、v0.4.0〜）を選ぶと、その色差が N 段ぶん以下なら同じ色とみなす
+//!   （換算は `colorspace::ColorMetric` の doc。今までの範囲の角まで入る大きさ）
 //! - **表示中のシーン**は本体の API（`call_read_section`）で探し、置換もできる
 //! - **他のシーン**は最後に保存した `.aup2` を読んで一覧に出すだけ（API で他シーンは編集できない）
 //! - 置換は**ボタン操作のときだけ**、1 回の `call_edit_section` にまとめる。
@@ -14,6 +16,7 @@ use std::path::Path;
 use aviutl2::generic::{EffectItemType, ObjectHandle};
 
 use crate::color::Rgb;
+use crate::colorspace::{ColorMatcher, ColorMetric};
 use crate::edit_ops::{self, RawItem};
 use crate::tracker::ColorItemKey;
 
@@ -31,8 +34,16 @@ pub enum HitKind {
 pub struct SearchQuery {
     pub target: Rgb,
     pub tolerance: u8,
+    /// 許容値の色差（既定は今までの各成分の差）
+    pub metric: ColorMetric,
     pub include_text: bool,
     pub all_scenes: bool,
+}
+
+impl SearchQuery {
+    pub fn matcher(&self) -> ColorMatcher {
+        ColorMatcher::new(self.target, self.tolerance, self.metric)
+    }
 }
 
 #[derive(Clone)]
@@ -77,9 +88,21 @@ pub struct ReplaceReport {
     pub errors: Vec<String>,
 }
 
-pub fn within(a: Rgb, b: Rgb, tolerance: u8) -> bool {
-    let d = |x: u8, y: u8| x.abs_diff(y) <= tolerance;
-    d(a.r, b.r) && d(a.g, b.g) && d(a.b, b.b)
+/// 判定を色ごとに 1 回だけ行う（同じ色の項目が多くても、色差の変換を繰り返さない）
+struct MemoMatcher {
+    matcher: ColorMatcher,
+    seen: HashMap<Rgb, bool>,
+}
+
+impl MemoMatcher {
+    fn new(matcher: ColorMatcher) -> Self {
+        Self { matcher, seen: HashMap::new() }
+    }
+
+    fn matches(&mut self, c: Rgb) -> bool {
+        let matcher = &self.matcher;
+        *self.seen.entry(c).or_insert_with(|| matcher.matches(c))
+    }
 }
 
 /// テキスト中の `<#rrggbb>` / `<#rrggbb,rrggbb>` のカラーコード部分（6 桁の範囲と色）。
@@ -116,10 +139,10 @@ pub fn text_tag_spans(text: &str) -> Vec<(Range<usize>, Rgb)> {
 }
 
 /// しきい値内の `<#…>` の色を置き換える。`(新しい本文, 置き換えた色の数)`。
-pub fn replace_text_tags(text: &str, target: Rgb, tolerance: u8, new: Rgb) -> (String, usize) {
+pub fn replace_text_tags(text: &str, matcher: &ColorMatcher, new: Rgb) -> (String, usize) {
     let spans: Vec<Range<usize>> = text_tag_spans(text)
         .into_iter()
-        .filter(|(_, c)| within(*c, target, tolerance) && *c != new)
+        .filter(|(_, c)| matcher.matches(*c) && *c != new)
         .map(|(r, _)| r)
         .collect();
     if spans.is_empty() {
@@ -137,16 +160,14 @@ pub fn replace_text_tags(text: &str, target: Rgb, tolerance: u8, new: Rgb) -> (S
 }
 
 /// 1 項目を判定する。一致した色の列（無ければ `None`）。
-fn match_value(value: &str, kind: HitKind, q: &SearchQuery) -> Option<Vec<Rgb>> {
+fn match_value(value: &str, kind: HitKind, m: &mut MemoMatcher) -> Option<Vec<Rgb>> {
     match kind {
-        HitKind::ColorItem => Rgb::from_item_value(value)
-            .filter(|c| within(*c, q.target, q.tolerance))
-            .map(|c| vec![c]),
+        HitKind::ColorItem => Rgb::from_item_value(value).filter(|c| m.matches(*c)).map(|c| vec![c]),
         HitKind::TextTag => {
             let found: Vec<Rgb> = text_tag_spans(value)
                 .into_iter()
                 .map(|(_, c)| c)
-                .filter(|c| within(*c, q.target, q.tolerance))
+                .filter(|c| m.matches(*c))
                 .collect();
             (!found.is_empty()).then_some(found)
         }
@@ -179,6 +200,7 @@ fn collect_hits(
     types: ItemTypesFn,
 ) -> Vec<Hit> {
     let mut cache: HashMap<String, (HashSet<String>, HashSet<String>)> = HashMap::new();
+    let mut memo = MemoMatcher::new(q.matcher());
     let mut hits = Vec::new();
     for obj in objects {
         for item in obj.items {
@@ -192,7 +214,7 @@ fn collect_hits(
             } else {
                 continue;
             };
-            if let Some(found) = match_value(&item.value, kind, q) {
+            if let Some(found) = match_value(&item.value, kind, &mut memo) {
                 hits.push(Hit {
                     scene_id,
                     scene_name: scene_name.to_string(),
@@ -408,7 +430,9 @@ fn scene_mismatch(hits: &[Hit], current_scene: i32) -> Option<String> {
 
 /// チェックした項目を置き換える（ボタン操作専用）。1 回の編集セクション＝本体の Undo 1 回ぶん。
 /// 検索した後にシーンが切り替わっていたら、1 つも書かずに `Err` を返す。
-pub fn apply(hits: Vec<Hit>, target: Rgb, tolerance: u8, new: Rgb) -> Result<ReplaceReport, String> {
+/// 判定は検索と同じ条件（`query` の探す色・しきい値・色差）で読み直して行う。
+pub fn apply(hits: Vec<Hit>, query: &SearchQuery, new: Rgb) -> Result<ReplaceReport, String> {
+    let matcher = query.matcher();
     edit_ops::with_edit_section(move |edit| {
         if let Some(reason) = scene_mismatch(&hits, edit.info.scene_id) {
             tracing::warn!(current_scene = edit.info.scene_id, "replace: scene changed after search");
@@ -432,10 +456,10 @@ pub fn apply(hits: Vec<Hit>, target: Rgb, tolerance: u8, new: Rgb) -> Result<Rep
             // 検索後に値が変わっていたら書き換えない
             let next = match hit.kind {
                 HitKind::ColorItem => Rgb::from_item_value(&current)
-                    .filter(|c| within(*c, target, tolerance) && *c != new)
+                    .filter(|c| matcher.matches(*c) && *c != new)
                     .map(|_| new.hex()),
                 HitKind::TextTag => {
-                    let (text, n) = replace_text_tags(&current, target, tolerance, new);
+                    let (text, n) = replace_text_tags(&current, &matcher, new);
                     (n > 0).then_some(text)
                 }
             };
@@ -470,7 +494,11 @@ mod tests {
     }
 
     fn q(target: u32, tolerance: u8) -> SearchQuery {
-        SearchQuery { target: rgb(target), tolerance, include_text: true, all_scenes: true }
+        SearchQuery { target: rgb(target), tolerance, metric: ColorMetric::default(), include_text: true, all_scenes: true }
+    }
+
+    fn within(a: Rgb, b: Rgb, tolerance: u8) -> bool {
+        ColorMatcher::new(b, tolerance, ColorMetric::default()).matches(a)
     }
 
     #[test]
@@ -480,6 +508,61 @@ mod tests {
         assert!(within(rgb(0x818080), rgb(0x808080), 1), "1 だけ違う色をまとめられる");
         assert!(within(rgb(0x7f817f), rgb(0x808080), 1));
         assert!(!within(rgb(0x828080), rgb(0x808080), 1));
+    }
+
+    /// v0.3.1 の判定（各成分の差）をそのまま写したもの。既定の色差で同じ集合になることを見る
+    fn within_v031(a: Rgb, b: Rgb, tolerance: u8) -> bool {
+        let d = |x: u8, y: u8| x.abs_diff(y) <= tolerance;
+        d(a.r, b.r) && d(a.g, b.g) && d(a.b, b.b)
+    }
+
+    /// 既定（各成分の差）は、どの許容値でも v0.3.1 と同じ色を拾う
+    #[test]
+    fn default_metric_matches_v031_exactly() {
+        let mut seed = 0x2545f491u32;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let near = |t: u8, s: u32| (t as i32 + (s % 161) as i32 - 80).clamp(0, 255) as u8;
+        let mut checked = 0;
+        for tolerance in [0u8, 1, 2, 7, 16, 33, 64] {
+            for _ in 0..40 {
+                let target = rgb(next() & 0xffffff);
+                let m = ColorMatcher::new(target, tolerance, ColorMetric::default());
+                for i in 0..500 {
+                    // 探す色の近く（各成分 ±80）と、全体からの色を混ぜる
+                    let c = if i % 3 == 0 {
+                        rgb(next() & 0xffffff)
+                    } else {
+                        Rgb::new(near(target.r, next()), near(target.g, next()), near(target.b, next()))
+                    };
+                    assert_eq!(m.matches(c), within_v031(c, target, tolerance), "{} {} ±{tolerance}", target.hex(), c.hex());
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 7 * 40 * 500);
+    }
+
+    /// 色差を変えると拾う色が変わる（YCbCr は明るさを見ない）
+    #[test]
+    fn metric_changes_saved_project_hits() {
+        let aup = "[scene.1]\r\nname=サブ\r\n[1]\r\nlayer=0\r\nscene=1\r\nframe=0,9\r\n[1.0]\r\neffect.name=図形\r\n色=ff0000\r\n[1.1]\r\neffect.name=縁取り\r\n縁色=ff1010\r\n[1.2]\r\neffect.name=縁取り\r\n縁色=00ff00\r\n[1.3]\r\neffect.name=縁取り\r\n縁色=800000\r\n";
+        let found = |query: &SearchQuery| -> Vec<String> {
+            search_saved_project(aup, 0, query, &fake_types).iter().flat_map(|h| h.found.iter().map(|c| c.hex())).collect()
+        };
+        let mut query = q(0xff0000, 16);
+        query.include_text = false;
+        assert_eq!(found(&query), ["ff0000", "ff1010"], "各成分の差（今まで）");
+        query.metric = ColorMetric::YCbCr;
+        assert_eq!(found(&query), ["ff0000", "ff1010"], "YCbCr でも今まで拾えた色は拾う");
+        query.tolerance = 64;
+        assert_eq!(found(&query), ["ff0000", "ff1010", "800000"], "YCbCr は明るさを見ないので、暗い赤も N を広げると拾う");
+        query.metric = ColorMetric::PerChannel;
+        assert_eq!(found(&query), ["ff0000", "ff1010"], "各成分の差では 0x7f 離れた暗い赤は拾わない");
     }
 
     #[test]
@@ -496,10 +579,11 @@ mod tests {
     #[test]
     fn text_tags_are_replaced_within_tolerance() {
         let text = "<#ff0000>A<#fe0101,ff0000>B<#00ff00>";
-        let (out, n) = replace_text_tags(text, rgb(0xff0000), 1, rgb(0x123456));
+        let m = |t: u32, tol: u8| ColorMatcher::new(rgb(t), tol, ColorMetric::default());
+        let (out, n) = replace_text_tags(text, &m(0xff0000, 1), rgb(0x123456));
         assert_eq!(n, 3);
         assert_eq!(out, "<#123456>A<#123456,123456>B<#00ff00>");
-        let (same, n) = replace_text_tags(text, rgb(0x0000ff), 0, rgb(0x123456));
+        let (same, n) = replace_text_tags(text, &m(0x0000ff, 0), rgb(0x123456));
         assert_eq!((same.as_str(), n), (text, 0));
     }
 
@@ -569,5 +653,70 @@ mod tests {
         assert_eq!(places, ["テキスト / 文字色", "テキスト / テキスト の <#>"]);
         query.include_text = false;
         assert_eq!(search_saved_project(AUP2, 1, &query, &fake_types).len(), 1);
+    }
+
+    /// 置換の対象が多い場合（オブジェクト 500・色の項目 1 つあたり 5 個＋テキストの `<#>` 3 個、色はほぼすべて違う）の
+    /// 判定の時間。表示中のシーンと同じ `collect_hits` を通す（本体の読み取りは含まない）。既定では走らせない:
+    ///   cargo test --release --lib perf_search_500_objects -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn perf_search_500_objects() {
+        let mut seed = 0x1234567u32;
+        let mut color = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            // 探す色（ff0000）の近くも混ぜる
+            if seed % 8 == 0 {
+                format!("ff{:02x}{:02x}", (seed >> 24) & 15, (seed >> 16) & 15)
+            } else {
+                format!("{:06x}", seed & 0xffffff)
+            }
+        };
+        let mut objects = || -> Vec<ObjectItems> {
+            (0..500)
+                .map(|i| {
+                    let item = |effect: &str, name: &str, value: String| RawItem {
+                        effect_name: effect.into(),
+                        effect_index: 0,
+                        item_name: name.into(),
+                        value,
+                    };
+                    let text = format!("<#{}>赤<#{},{}>縁<#>", color(), color(), color());
+                    ObjectItems {
+                        layer: i % 100,
+                        frame_start: i,
+                        frame_end: i + 30,
+                        object: None,
+                        items: vec![
+                            item("テキスト", "文字色", color()),
+                            item("テキスト", "影・縁色", color()),
+                            item("テキスト", "テキスト", text),
+                            item("図形", "色", color()),
+                            item("縁取り", "縁色", color()),
+                            item("縁取り", "縁色", color()),
+                            item("標準描画", "X", "0.00".into()),
+                        ],
+                    }
+                })
+                .collect()
+        };
+        for metric in ColorMetric::ALL {
+            let query = SearchQuery { target: rgb(0xff0000), tolerance: 16, metric, include_text: true, all_scenes: false };
+            let reps = 10;
+            let mut total = 0.0;
+            let mut hits = 0;
+            for _ in 0..reps {
+                let objs = objects();
+                let t = std::time::Instant::now();
+                hits = collect_hits(0, "Root", objs, &query, &fake_types).len();
+                total += t.elapsed().as_secs_f64() * 1000.0;
+            }
+            println!(
+                "[INFO] 置換の判定 {:<10} オブジェクト 500・色 4000: {:.3} ms（見つかった項目 {hits}）",
+                metric.label(),
+                total / reps as f64
+            );
+        }
     }
 }
